@@ -225,21 +225,29 @@ fn scalar_line<'a, const N: usize, F: FnMut(&[&[u8]; N])>(
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn masks(p: *const u8) -> (u128, u128, u128) {
+unsafe fn block_masks(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
-    let newline = _mm256_set1_epi8(b'\n' as i8);
-    let comma = _mm256_set1_epi8(b',' as i8);
-    let quote = _mm256_set1_epi8(b'"' as i8);
-    let (mut n, mut c, mut q) = (0u128, 0u128, 0u128);
-    for k in 0..4 {
-        let v = _mm256_loadu_si256(p.add(32 * k) as *const __m256i);
-        n |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, newline)) as u32 as u128) << (32 * k);
-        c |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, comma)) as u32 as u128) << (32 * k);
-        q |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, quote)) as u32 as u128) << (32 * k);
-    }
+    let lo = _mm256_loadu_si256(p as *const __m256i);
+    let hi = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let mask = |v: __m256i, c: u8| -> u32 { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 };
+    let n = mask(lo, b'\n') as u64 | (mask(hi, b'\n') as u64) << 32;
+    let c = mask(lo, b',') as u64 | (mask(hi, b',') as u64) << 32;
+    let q = mask(lo, b'"') as u64 | (mask(hi, b'"') as u64) << 32;
     (n, c, q)
 }
 
+/// Bits from `from` (0..=64) upwards.
+#[inline(always)]
+fn bits_from(from: usize) -> u64 {
+    if from >= 64 { 0 } else { !0u64 << from }
+}
+
+/// The lines of `[start, end)` from 64-byte blocks: each byte is classified once,
+/// then the commas and newlines are walked in order, the line state carrying
+/// over from one block to the next. Same rules as csv::fields: exactly N-1 commas,
+/// a field is quoted when it is at least 2 bytes long and starts and ends with a
+/// quote, and the line is well formed exactly when it holds two quotes per quoted
+/// field and no other quote.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,popcnt")]
 unsafe fn simd_range<const N: usize, F: FnMut(&[&[u8]; N])>(
@@ -250,58 +258,78 @@ unsafe fn simd_range<const N: usize, F: FnMut(&[&[u8]; N])>(
     f: &mut F,
 ) {
     let mut out: [&[u8]; N] = [&[]; N];
-    let base = buf.as_ptr();
-    let mut p = start;
-    while p < end {
-        if p + 128 > buf.len() {
-            p = scalar_line::<N, F>(buf, p, data_len, &mut out, f);
-            continue;
-        }
-        let (n, c, q) = masks(base.add(p));
-        if n == 0 {
-            // A line of 128 bytes or more.
-            p = scalar_line::<N, F>(buf, p, data_len, &mut out, f);
-            continue;
-        }
-        // The window lies inside buf; a newline past data_len is padding, which
-        // only ends a last line that has no newline of its own.
-        let l = n.trailing_zeros() as usize;
-        let below = (1u128 << l) - 1;
-        let commas = c & below;
-        if l != 0 && commas.count_ones() as usize == N - 1 {
-            // A field is quoted when it is at least 2 bytes long and starts and ends
-            // with a quote. The line is well formed exactly when its quotes are
-            // those of its quoted fields: two per quoted field, none elsewhere.
-            let quotes = (q & below).count_ones();
-            let line = buf.get_unchecked(p..p + l);
-            let (mut lo, mut hi) = (commas as u64, (commas >> 64) as u64);
-            let mut s = 0usize;
-            let mut quoted = 0u32;
-            for (k, slot) in out.iter_mut().enumerate() {
-                let e = if k + 1 == N {
-                    l
-                } else if lo != 0 {
-                    let e = lo.trailing_zeros() as usize;
-                    lo &= lo - 1;
-                    e
+    let mut line_start = start;
+    let mut field_start = start;
+    let mut k = 0usize; // fields completed in the current line
+    let mut too_many = false;
+    let mut quotes = 0u32; // quotes seen in the current line
+    let mut quoted = 0u32; // quoted fields in the current line
+    let mut block = start;
+    while line_start < end {
+        // Masks of this block; past the data (or the buffer) every byte is '\n'.
+        let (nl, comma, quote) = if block + 64 <= data_len.min(buf.len()) {
+            block_masks(buf.as_ptr().add(block))
+        } else {
+            let mut tail = [b'\n'; 64];
+            let have = data_len.saturating_sub(block).min(64);
+            tail[..have].copy_from_slice(&buf[block..block + have]);
+            block_masks(tail.as_ptr())
+        };
+        // Only bytes at or after the current line start count.
+        let skip = bits_from(line_start.saturating_sub(block));
+        let mut structural = (nl | comma) & skip;
+        let mut counted = line_start.saturating_sub(block); // quotes counted up to here
+        while structural != 0 {
+            let i = structural.trailing_zeros() as usize;
+            structural &= structural - 1;
+            let pos = block + i;
+            if (nl >> i) & 1 == 0 {
+                // a comma ends field k
+                if k + 1 < N {
+                    let field = buf.get_unchecked(field_start..pos);
+                    let w = field.len();
+                    *out.get_unchecked_mut(k) = if w >= 2 && field[0] == b'"' && field[w - 1] == b'"' {
+                        quoted += 1;
+                        buf.get_unchecked(field_start + 1..pos - 1)
+                    } else {
+                        field
+                    };
+                    k += 1;
                 } else {
-                    let e = 64 + hi.trailing_zeros() as usize;
-                    hi &= hi - 1;
-                    e
-                };
-                if quotes != 0 && e >= s + 2 && *line.get_unchecked(s) == b'"' && *line.get_unchecked(e - 1) == b'"' {
-                    quoted += 1;
-                    *slot = buf.get_unchecked(p + s + 1..p + e - 1);
-                } else {
-                    *slot = buf.get_unchecked(p + s..p + e);
+                    too_many = true;
                 }
-                s = e + 1;
+                field_start = pos + 1;
+                continue;
             }
-            if quotes == 2 * quoted {
-                f(&out);
+            // a newline (or the end of the data) ends the line
+            quotes += (quote & bits_from(counted) & !bits_from(i)).count_ones();
+            counted = i + 1;
+            let line_end = pos.min(data_len);
+            if !too_many && k + 1 == N && line_end > line_start {
+                let field = buf.get_unchecked(field_start..line_end);
+                let w = field.len();
+                *out.get_unchecked_mut(N - 1) = if w >= 2 && field[0] == b'"' && field[w - 1] == b'"' {
+                    quoted += 1;
+                    buf.get_unchecked(field_start + 1..line_end - 1)
+                } else {
+                    field
+                };
+                if quotes == 2 * quoted {
+                    f(&out);
+                }
+            }
+            line_start = pos + 1;
+            field_start = pos + 1;
+            k = 0;
+            too_many = false;
+            quotes = 0;
+            quoted = 0;
+            if line_start >= end {
+                return;
             }
         }
-        p += l + 1;
+        quotes += (quote & bits_from(counted)).count_ones();
+        block += 64;
     }
 }
 
