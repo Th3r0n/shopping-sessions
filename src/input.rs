@@ -221,7 +221,7 @@ pub fn use_simd() -> bool {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi1") && is_x86_feature_detected!("popcnt")
+        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi1") && is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("popcnt")
     }
     #[cfg(not(target_arch = "x86_64"))]
     false
@@ -242,8 +242,14 @@ pub fn range_lines<const N: usize, F: FnMut(&[&[u8]; N])>(
 ) {
     #[cfg(target_arch = "x86_64")]
     if simd {
-        // SAFETY: use_simd() checked the CPU features; windows are bounds-checked.
-        unsafe { simd_range::<N, F>(buf, start, end, data_len, f) };
+        // SAFETY: use_simd() checked the CPU features; blocks are bounds-checked.
+        unsafe {
+            if *OLD_TOKENIZER {
+                simd_range::<N, F>(buf, start, end, data_len, f)
+            } else {
+                TOKENS.with(|t| staged_range::<N, F>(&mut t.borrow_mut(), buf, start, end, data_len, f))
+            }
+        };
         return;
     }
     let _ = simd;
@@ -383,6 +389,224 @@ unsafe fn simd_range<const N: usize, F: FnMut(&[&[u8]; N])>(
     }
 }
 
+static OLD_TOKENIZER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("SS_TOK").as_deref() == Ok("old"));
+
+/// Bytes tokenized by stage 1 before stage 2 runs, so the index arrays stay in cache.
+const SUB: usize = 16 << 10;
+
+/// Stage 1 output, reused by each thread.
+struct Tokens {
+    /// Separator (comma or newline) positions relative to the round's first block;
+    /// slot 0 is the line start - 1.
+    pos: Vec<u32>,
+    /// Per newline: its index in `pos`, and the quotes before it in the round.
+    nl_idx: Vec<u32>,
+    nl_quotes: Vec<u32>,
+    /// Bit i: the field after pos[i] starts with a quote.
+    q_start: Vec<u64>,
+    /// Bit i: the byte before pos[i] is a quote.
+    q_end: Vec<u64>,
+}
+
+thread_local! {
+    static TOKENS: std::cell::RefCell<Tokens> = std::cell::RefCell::new(Tokens {
+        pos: vec![0; SUB + 1024],
+        nl_idx: vec![0; SUB + 1024],
+        nl_quotes: vec![0; SUB + 1024],
+        q_start: vec![0; SUB / 64 + 64],
+        q_end: vec![0; SUB / 64 + 64],
+    });
+}
+
+/// Appends bit fields to a stream of u64 words.
+struct BitWriter {
+    p: *mut u64,
+    acc: u64,
+    fill: u32,
+}
+
+impl BitWriter {
+    /// `n` <= 64 bits; `bits` has nothing at or above bit n.
+    #[inline(always)]
+    unsafe fn put(&mut self, bits: u64, n: u32) {
+        self.acc |= bits.checked_shl(self.fill).unwrap_or(0);
+        let total = self.fill + n;
+        if total >= 64 {
+            *self.p = self.acc;
+            self.p = self.p.add(1);
+            self.acc = if self.fill == 0 { 0 } else { bits >> (64 - self.fill) };
+            self.fill = total - 64;
+        } else {
+            self.fill = total;
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn flush(&mut self) {
+        *self.p = self.acc;
+        *self.p.add(1) = 0;
+    }
+}
+
+/// Bits i..i+N of a bit stream (N <= 8).
+#[inline(always)]
+unsafe fn read_bits<const N: usize>(stream: *const u64, i: usize) -> u32 {
+    (((stream as *const u8).add(i >> 3) as *const u64).read_unaligned() >> (i & 7)) as u32 & ((1u32 << N) - 1)
+}
+
+/// The same lines as `simd_range`, in two stages per round of SUB bytes: stage 1
+/// classifies 64-byte blocks into a flat array of separator positions, two bit
+/// streams (field starts with a quote, byte before a separator is a quote) and, per
+/// newline, its separator index and quote count; stage 2 takes each line whole: N - 1
+/// commas, field bounds for all fields at once (8 lanes), quotes stripped without
+/// branches. A field is quoted when it is at least 2 bytes long and starts and ends
+/// with a quote; the line is well formed when its fields' start and end flags agree,
+/// no 1-byte field is a lone quote, and it holds exactly two quotes per quoted field.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
+unsafe fn staged_range<const N: usize, F: FnMut(&[&[u8]; N])>(
+    t: &mut Tokens,
+    buf: &[u8],
+    start: usize,
+    end: usize,
+    data_len: usize,
+    f: &mut F,
+) {
+    use std::arch::x86_64::*;
+    const { assert!(N >= 2 && N <= 8) };
+    let limit = data_len.min(buf.len());
+    let b = buf.as_ptr();
+    let pp = t.pos.as_mut_ptr();
+    let lane_bit = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+    let active = _mm256_cmpgt_epi32(_mm256_set1_epi32(N as i32), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+    let mut out: [&[u8]; N] = [&[]; N];
+    let mut line_start = start;
+    while line_start < end {
+        // ---- stage 1: the blocks from the one holding line_start; the last one
+        // holds position `limit` (bytes from there on read as '\n')
+        let at = line_start & !63;
+        let stop = (at + SUB).min((limit & !63) + 64);
+        *pp = ((line_start - at) as u32).wrapping_sub(1);
+        let (mut np, mut nn, mut quotes) = (1usize, 0usize, 0u32);
+        let mut starts_w = BitWriter { p: t.q_start.as_mut_ptr(), acc: 0, fill: 0 };
+        let mut ends_w = BitWriter { p: t.q_end.as_mut_ptr(), acc: 0, fill: 0 };
+        ends_w.put(0, 1); // keeps the q_end index equal to the pos index
+        let mut live = !0u64 << (line_start & 63);
+        let mut first_field = 1u64 << (line_start & 63);
+        let (mut carry_sep, mut carry_quote) = (0u64, 0u64);
+        let mut block = at;
+        while block < stop {
+            let (nl, comma, quote) = if block + 64 <= limit {
+                block_masks(b.add(block))
+            } else {
+                let mut tail = [b'\n'; 64];
+                let have = limit.saturating_sub(block).min(64);
+                tail[..have].copy_from_slice(&buf[block..block + have]);
+                block_masks(tail.as_ptr())
+            };
+            let (nl, quote, sep) = (nl & live, quote & live, (nl | comma) & live);
+            live = !0;
+            let rel = (block - at) as u32;
+            let count = sep.count_ones() as usize;
+            {
+                // 8 positions written unconditionally: no branch for the usual block
+                let dst = pp.add(np);
+                let mut bits = sep;
+                macro_rules! put {
+                    ($i:expr) => {
+                        *dst.add($i) = rel + bits.trailing_zeros();
+                        bits &= bits.wrapping_sub(1);
+                    };
+                }
+                put!(0);
+                put!(1);
+                put!(2);
+                put!(3);
+                put!(4);
+                put!(5);
+                put!(6);
+                put!(7);
+                let mut i = 8;
+                while bits != 0 {
+                    put!(i);
+                    i += 1;
+                }
+            }
+            let starts = (sep << 1) | carry_sep | first_field;
+            first_field = 0;
+            carry_sep = sep >> 63;
+            starts_w.put(_pext_u64(quote, starts), starts.count_ones());
+            ends_w.put(_pext_u64((quote << 1) | carry_quote, sep), count as u32);
+            carry_quote = quote >> 63;
+            // newlines: two written unconditionally
+            let mut rest = nl;
+            let newlines = nl.count_ones() as usize;
+            let mut k = 0;
+            loop {
+                let below = (rest & rest.wrapping_neg()).wrapping_sub(1);
+                *t.nl_idx.get_unchecked_mut(nn + k) = np as u32 + (sep & below).count_ones();
+                *t.nl_quotes.get_unchecked_mut(nn + k) = quotes + (quote & below).count_ones();
+                rest &= rest.wrapping_sub(1);
+                k += 1;
+                if k >= 2 && rest == 0 {
+                    break;
+                }
+            }
+            nn += newlines;
+            np += count;
+            quotes += quote.count_ones();
+            block += 64;
+        }
+        starts_w.flush();
+        ends_w.flush();
+        if nn == 0 {
+            // a line longer than the round: the scalar path takes it
+            line_start = scalar_line::<N, F>(buf, line_start, data_len, &mut out, f);
+            continue;
+        }
+        // ---- stage 2: every line that ends in these blocks
+        let base = b.add(at);
+        let (mut next_j, mut quotes_before) = (1usize, 0u32);
+        for li in 0..nn {
+            let j_end = *t.nl_idx.get_unchecked(li) as usize;
+            let line_quotes = *t.nl_quotes.get_unchecked(li) - quotes_before;
+            quotes_before = *t.nl_quotes.get_unchecked(li);
+            let j = next_j;
+            next_j = j_end + 1;
+            let first = at + (*pp.add(j - 1)).wrapping_add(1) as usize;
+            if first >= end {
+                return;
+            }
+            line_start = at + *pp.add(j_end) as usize + 1;
+            if j_end - j != N - 1 {
+                continue; // not N fields (or an empty line)
+            }
+            let quoted = read_bits::<N>(t.q_start.as_ptr(), j - 1);
+            if (quoted != read_bits::<N>(t.q_end.as_ptr(), j)) | (2 * quoted.count_ones() != line_quotes) {
+                continue;
+            }
+            let lanes = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(quoted as i32), lane_bit), lane_bit);
+            let left = _mm256_loadu_si256(pp.add(j - 1) as *const __m256i);
+            let right = _mm256_loadu_si256(pp.add(j) as *const __m256i);
+            // a lone quote (a 1-byte field flagged at both ends) is not a quoted field
+            let width = _mm256_sub_epi32(right, left); // field length + 1
+            let lone = _mm256_and_si256(_mm256_and_si256(lanes, active), _mm256_cmpgt_epi32(_mm256_set1_epi32(3), width));
+            if _mm256_movemask_epi8(lone) != 0 {
+                continue;
+            }
+            let starts = _mm256_sub_epi32(_mm256_sub_epi32(left, _mm256_set1_epi32(-1)), lanes);
+            let ends = _mm256_add_epi32(right, lanes);
+            let (mut s, mut e) = ([0u32; 8], [0u32; 8]);
+            _mm256_storeu_si256(s.as_mut_ptr() as *mut __m256i, starts);
+            _mm256_storeu_si256(e.as_mut_ptr() as *mut __m256i, ends);
+            for k in 0..N {
+                *out.get_unchecked_mut(k) = std::slice::from_raw_parts(base.add(s[k] as usize), (e[k] - s[k]) as usize);
+            }
+            f(&out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +651,66 @@ mod tests {
             assert_eq!(a, b);
             assert_eq!(collect::<4>(&text, true), collect::<4>(&text, false));
             assert_eq!(collect::<7>(&text, true), collect::<7>(&text, false));
+        }
+    }
+
+    /// Lines shaped like the real ones (quoted fields, lone quotes, wrong field
+    /// counts, a quote inside a field) and lines longer than a stage-1 round, over
+    /// ranges that start and end anywhere: the staged tokenizer, the old SIMD one and
+    /// the scalar one agree.
+    #[test]
+    fn staged_matches_scalar_on_csv_like_text() {
+        if !use_simd() {
+            return;
+        }
+        let pieces: &[&[u8]] = &[b"e1", b"\"u2\"", b"", b"\"\"", b"\"", b"a\"b", b"\"x", b"y\"", b"2027-01-01T00:00:00Z", b"view", b"\r", b" ", b"\"\"\""];
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        for round in 0..3000 {
+            let mut text = Vec::new();
+            let lines = 1 + rng(&mut s) % 60;
+            for _ in 0..lines {
+                let fields = if rng(&mut s) % 8 == 0 { 1 + rng(&mut s) % 9 } else { 7 };
+                for k in 0..fields {
+                    if k > 0 {
+                        text.push(b',');
+                    }
+                    if round % 50 == 0 && rng(&mut s) % 40 == 0 {
+                        text.extend(std::iter::repeat_n(b'q', 17_000 + (rng(&mut s) % 3000) as usize)); // > SUB
+                    } else {
+                        text.extend_from_slice(pieces[(rng(&mut s) % pieces.len() as u64) as usize]);
+                    }
+                }
+                if rng(&mut s) % 30 != 0 {
+                    text.push(b'\n');
+                }
+            }
+            let n = text.len();
+            // a range [start, end) whose start is a line start
+            let cut = (rng(&mut s) % (n as u64 + 1)) as usize;
+            let start = match text[..cut].iter().rposition(|&c| c == b'\n') {
+                Some(i) => i + 1,
+                None => 0,
+            };
+            let end = start + (rng(&mut s) % (n - start + 1) as u64) as usize;
+            for padded in [false, true] {
+                let mut buf = text.clone();
+                if padded {
+                    buf.extend_from_slice(&[b'\n'; PAD]);
+                }
+                let run = |old: bool, simd: bool| {
+                    let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+                    let mut f = |x: &[&[u8]; 7]| got.push(x.iter().map(|y| y.to_vec()).collect());
+                    if old {
+                        unsafe { simd_range::<7, _>(&buf, start, end, n, &mut f) };
+                    } else {
+                        range_lines::<7, _>(&buf, start, end, n, simd, &mut f);
+                    }
+                    got
+                };
+                let scalar = run(false, false);
+                assert_eq!(run(false, true), scalar, "round {round} padded {padded}");
+                assert_eq!(run(true, true), scalar, "round {round} padded {padded} (old)");
+            }
         }
     }
 }

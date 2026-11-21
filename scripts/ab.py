@@ -14,8 +14,15 @@ from bench import run
 PHASE = re.compile(r"\+\s*([0-9.]+)s .*\] (links parsed|events parsed|deduplicated|names resolved|sessionized|written)")
 
 
+TOTAL = re.compile(r"\[\s*([0-9.]+)s .*\] written")
+
+
 def phases(log):
-    return {m.group(2): float(m.group(1)) for m in PHASE.finditer(log)}
+    out = {m.group(2): float(m.group(1)) for m in PHASE.finditer(log)}
+    m = TOTAL.search(log)
+    if m:
+        out["internal"] = float(m.group(1))  # process start to output written
+    return out
 
 
 def main():
@@ -51,6 +58,12 @@ def main():
         print(f"{tag} {image}: median {statistics.median(walls[image]):.3f}s  " +
               "  ".join(f"{k} {v:.3f}" for k, v in per.items()))
     print(f"median B-A {statistics.median(diffs):+.3f}s")
+    ia = [p["internal"] for p in logs[args.a] if "internal" in p]
+    ib = [p["internal"] for p in logs[args.b] if "internal" in p]
+    if ia and ib:
+        di = [b - a for a, b in zip(ia, ib)]
+        print(f"internal: A {statistics.median(ia):.3f}s  B {statistics.median(ib):.3f}s  median B-A {statistics.median(di):+.3f}s "
+              f"({100 * statistics.median(di) / statistics.median(ia):+.1f}%)")
 
 
 if __name__ == "__main__":

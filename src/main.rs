@@ -76,7 +76,7 @@ fn main() {
         .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
         .unwrap_or(4)
         .max(1);
-    let chunk_size = env_usize("SS_CHUNK").unwrap_or(4 << 20).max(1);
+    let chunk_size = env_usize("SS_CHUNK").unwrap_or(2 << 20).max(1);
 
     let window = lookups::read_manifest(&data);
     let products = lookups::Products::read(&data);
