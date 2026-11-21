@@ -58,11 +58,24 @@ impl Names {
 
     /// The person's name for a user key: itself if it appears in no link.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get(&self, user: u64) -> u64 {
         let h = mix(user);
         if !self.maybe_renamed(h) {
             return user;
         }
+        self.probe(user, h)
+    }
+
+    /// `get` for a key whose filter bit is known to be set (a deferred lookup):
+    /// straight to the table.
+    #[inline]
+    pub fn get_flagged(&self, user: u64) -> u64 {
+        self.probe(user, mix(user))
+    }
+
+    #[inline(always)]
+    fn probe(&self, user: u64, h: u64) -> u64 {
         let mut i = crate::hash::bucket(h, self.size);
         loop {
             let [k, name] = self.slots[i];

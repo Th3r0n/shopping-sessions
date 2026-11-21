@@ -223,7 +223,7 @@ pub fn dedup(
 pub fn resolve_deferred_clicks<'a>(clicks: impl Iterator<Item = &'a [[u64; 3]]>, names: &Names, out: &mut crate::arena::Words3) {
     for part in clicks {
         for c in PersonClick::of_words(part) {
-            let c = PersonClick { person: names.get(c.person), ..*c };
+            let c = PersonClick { person: names.get_flagged(c.person), ..*c };
             out.push(bucket(mix(c.person), out.parts()), c.words());
         }
     }
@@ -235,7 +235,7 @@ pub fn resolve_deferred_clicks<'a>(clicks: impl Iterator<Item = &'a [[u64; 3]]>,
 pub fn resolve_deferred<'a>(events: impl Iterator<Item = &'a [PersonEvent]>, names: &Names, out: &mut Scatter<PersonEvent>) {
     for part in events {
         for &e in part {
-            let e = PersonEvent { person: names.get(e.person), packed: e.packed };
+            let e = PersonEvent { person: names.get_flagged(e.person), packed: e.packed };
             out.push_wc(bucket(mix(e.person), out.parts()), e);
         }
     }

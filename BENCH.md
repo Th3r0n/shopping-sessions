@@ -90,3 +90,13 @@ Disk vs tmpfs /output: v1-baseline +0.36 s, current +0.10 s (the parallel releas
 Profile at 20M (SS_PROFILE=1, seconds summed over 8 threads): dedup insert 0.27, kept 0.06, route 0.34;
 sessions rank 0.19, sort 0.36, person 0.39. Names at 60M: inserts 0.069 s, unions 0.024, roots 0.024,
 names 0.019 (34k 4 KiB faults: no transparent huge pages available in the VM at that point).
+
+## Scorer vs local, cold cache
+
+Scores: e196257 1.10 s, d1b54d3 1.07 s, 217201f 1.05 s, for local internal times 0.642, 0.616, 0.573 s:
+the scorer moves by about half of the internal change (noise, a large fixed part, or I/O).
+Local cold page cache (drop_caches before the run): 1.42-1.5 s instead of 0.83 s, parse 0.89 s instead of
+0.26 s (the disk, about 2 GB/s, is the limit). Background readahead of every file (posix_fadvise WILLNEED)
+does not help cold (1.434 vs 1.419 s): 8 threads populating 2 MiB chunks already keep the disk busy.
+Also neutral: unmapping whole files in parallel after the parse instead of per-chunk MADV_DONTNEED (+1.1%),
+deferred name lookups without the filter check (+0.1%, kept: it is the same result with less work).
