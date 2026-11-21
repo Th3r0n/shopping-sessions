@@ -49,8 +49,10 @@ pub struct IdMap {
     mask: usize,
     len: usize,
     other: std::collections::HashMap<Vec<u8>, u32>,
-    /// Every ID inserted, until `seal`.
-    ids: Vec<Vec<u8>>,
+    /// While inserting: the common `prefix` + number shape, if every ID so far has
+    /// it, and the (number, value) pairs in insertion order.
+    shape: Option<(Vec<u8>, Vec<(usize, u32)>)>,
+    started: bool,
     /// When every ID is `prefix` + a canonical decimal number (like `c_123`), the
     /// values indexed by that number (value + 1; 0 = absent): any other string
     /// cannot be one of the IDs.
@@ -59,32 +61,53 @@ pub struct IdMap {
 
 impl IdMap {
     fn new() -> Self {
+        Self::with_capacity(8)
+    }
+
+    /// Room for about `n` IDs without growing.
+    fn with_capacity(n: usize) -> Self {
+        let size = (n.max(8) * 2).next_power_of_two();
         Self {
-            slots: vec![[0, 0]; 16],
-            mask: 15,
+            slots: vec![[0, 0]; size],
+            mask: size - 1,
             len: 0,
             other: std::collections::HashMap::new(),
-            ids: Vec::new(),
+            shape: None,
+            started: false,
             direct: None,
         }
     }
 
-    /// Builds the direct index when every ID has the `prefix` + number shape.
-    fn seal(&mut self) {
-        let ids = std::mem::take(&mut self.ids);
-        let Some(first) = ids.first() else { return };
-        let prefix: Vec<u8> = first.iter().take_while(|b| !b.is_ascii_digit()).copied().collect();
-        let number = |id: &[u8]| -> Option<usize> { canonical(id.strip_prefix(prefix.as_slice())?) };
-        if prefix.is_empty() || !ids.iter().all(|id| number(id).is_some()) {
-            return;
+    /// Records `id` for the direct index while it keeps the `prefix` + number shape.
+    fn note_shape(&mut self, id: &[u8], value: u32) {
+        if !self.started {
+            self.started = true;
+            let prefix: Vec<u8> = id.iter().take_while(|b| !b.is_ascii_digit()).copied().collect();
+            if !prefix.is_empty() {
+                self.shape = Some((prefix, Vec::new()));
+            }
         }
-        let max = ids.iter().filter_map(|id| number(id)).max().unwrap_or(0);
-        if max > 4 * ids.len() + 1024 {
-            return; // too sparse for a table
+        if let Some((prefix, pairs)) = &mut self.shape {
+            if pairs.capacity() == 0 {
+                pairs.reserve(self.slots.len() / 2);
+            }
+            match id.strip_prefix(prefix.as_slice()).and_then(canonical) {
+                Some(n) => pairs.push((n, value)),
+                None => self.shape = None,
+            }
+        }
+    }
+
+    /// Builds the direct index when every ID had the `prefix` + number shape.
+    fn seal(&mut self) {
+        let Some((prefix, pairs)) = self.shape.take() else { return };
+        let max = pairs.iter().map(|&(n, _)| n).max().unwrap_or(0);
+        if pairs.is_empty() || max > 4 * pairs.len() + 1024 {
+            return; // nothing to index, or too sparse for a table
         }
         let mut table = vec![0u32; max + 1];
-        for id in &ids {
-            table[number(id).unwrap()] = self.get_hashed(id).unwrap() + 1;
+        for (n, value) in pairs {
+            table[n] = value + 1; // later inserts overwrite, as in the hashed map
         }
         self.direct = Some((prefix, table));
     }
@@ -117,7 +140,7 @@ impl IdMap {
     }
 
     fn insert(&mut self, id: &[u8], value: u32) {
-        self.ids.push(id.to_vec());
+        self.note_shape(id, value);
         match key::pack(id) {
             Some(k) => self.insert_packed(k, value),
             None => {
@@ -136,6 +159,23 @@ impl IdMap {
             };
         }
         self.get_hashed(id)
+    }
+
+    /// Replaces every stored value v by `to[v]` (before `seal`).
+    fn remap(&mut self, to: &[u32]) {
+        for slot in self.slots.iter_mut() {
+            if slot[0] != 0 {
+                slot[1] = to[(slot[1] - 1) as usize] as u64 + 1;
+            }
+        }
+        for v in self.other.values_mut() {
+            *v = to[*v as usize];
+        }
+        if let Some((_, pairs)) = &mut self.shape {
+            for (_, v) in pairs.iter_mut() {
+                *v = to[*v as usize];
+            }
+        }
     }
 
     #[inline]
@@ -185,24 +225,45 @@ pub struct Products {
 
 impl Products {
     pub fn read(dir: &Path) -> Self {
-        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        small_rows::<2>(&dir.join("products.csv"), |[product, category]| {
+        // Products are mapped to provisional category numbers (first seen order),
+        // renumbered at the end in byte-wise name order.
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut index: std::collections::HashMap<Vec<u8>, u32> = std::collections::HashMap::new();
+        let path = dir.join("products.csv");
+        let bytes = std::fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0);
+        let mut map = IdMap::with_capacity(bytes / 10);
+        small_rows::<2>(&path, |[product, category]| {
             if !product.is_empty() && !category.is_empty() {
-                rows.push((product.to_vec(), category.to_vec()));
+                let provisional = match names.iter().position(|n| n.as_slice() == category) {
+                    Some(i) => i as u32,
+                    None if names.len() < 64 => {
+                        names.push(category.to_vec());
+                        names.len() as u32 - 1
+                    }
+                    None => {
+                        let next = names.len() as u32 + index.len() as u32;
+                        *index.entry(category.to_vec()).or_insert(next)
+                    }
+                };
+                map.insert(product, provisional);
             }
         });
-        let mut categories: Vec<Vec<u8>> = rows.iter().map(|(_, c)| c.clone()).collect();
+        // every distinct name, in provisional order
+        let mut all: Vec<(Vec<u8>, u32)> = names.into_iter().enumerate().map(|(i, n)| (n, i as u32)).collect();
+        all.extend(index);
+        let mut categories: Vec<Vec<u8>> = all.iter().map(|(n, _)| n.clone()).collect();
         categories.push(b"unknown".to_vec());
         categories.sort_unstable();
         categories.dedup();
         assert!(categories.len() <= u16::MAX as usize, "too many categories");
-        let id_of = |name: &[u8]| categories.binary_search_by(|c| c.as_slice().cmp(name)).unwrap() as u16;
-        let unknown = id_of(b"unknown");
-        let mut map = IdMap::new();
-        for (product, category) in &rows {
-            map.insert(product, id_of(category) as u32);
+        let id_of = |name: &[u8]| categories.binary_search_by(|c| c.as_slice().cmp(name)).unwrap() as u32;
+        let mut renumber = vec![0u32; all.len()];
+        for (name, provisional) in &all {
+            renumber[*provisional as usize] = id_of(name);
         }
+        map.remap(&renumber);
         map.seal();
+        let unknown = id_of(b"unknown") as u16;
         Self { map, categories, unknown }
     }
 
