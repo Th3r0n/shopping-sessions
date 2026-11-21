@@ -273,3 +273,225 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
     }
     names
 }
+
+/// The table of `build`, built on `threads` threads, lock-free: the slots are the
+/// union-find nodes. During the build a slot's second word is its parent's slot + 1
+/// (0 = a root). A union hangs, by compare-and-swap, the root whose key sorts last
+/// under the other root, so the root of a component is always its smallest key (its
+/// name) whatever the interleaving; finds halve paths with plain stores (a parent
+/// pointer only ever moves to an ancestor). After the unions every node points
+/// straight at its root, then every second word becomes the name.
+pub fn build_parallel(pairs: &[Vec<(u64, u64)>], threads: usize) -> Names {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    const TASK: usize = 1 << 14;
+    const L: usize = 16;
+    let total: usize = pairs.iter().map(Vec::len).sum();
+    let mut names = Names::with_slots(total * 5 + 64);
+    let size = names.size;
+    // SAFETY: AtomicU64 has the layout of u64; only this view touches the slots until the end.
+    let slots: &[[AtomicU64; 2]] = unsafe { std::slice::from_raw_parts(names.slots.as_mut_ptr() as *const [AtomicU64; 2], size) };
+    let home = |key: u64| crate::hash::bucket(mix(key), size);
+    let insert = |key: u64, inserted: &mut usize| -> u32 {
+        let mut i = home(key);
+        loop {
+            let cur = slots[i][0].load(Relaxed);
+            if cur == key {
+                return i as u32;
+            }
+            if cur == 0 {
+                match slots[i][0].compare_exchange(0, key, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        *inserted += 1;
+                        return i as u32;
+                    }
+                    Err(now) if now == key => return i as u32,
+                    Err(_) => {}
+                }
+            }
+            i += 1;
+            if i == size {
+                i = 0;
+            }
+        }
+    };
+    let parent = |x: usize| match slots[x][1].load(Relaxed) {
+        0 => x,
+        w => (w - 1) as usize,
+    };
+    let find = |mut x: usize| loop {
+        let p = parent(x);
+        if p == x {
+            return x;
+        }
+        let g = parent(p);
+        if g != p {
+            slots[x][1].store(g as u64 + 1, Relaxed); // g is an ancestor of x
+        }
+        x = g;
+    };
+    let tasks: Vec<(usize, usize, usize)> = pairs
+        .iter()
+        .enumerate()
+        .flat_map(|(v, p)| (0..p.len()).step_by(TASK).map(move |s| (v, s, (s + TASK).min(p.len()))))
+        .collect();
+    let threads = threads.clamp(1, tasks.len().max(1));
+
+    // 1. every endpoint into the table, prefetched L pairs ahead
+    let next = AtomicUsize::new(0);
+    let mut nodes = 0usize;
+    let mut slot_pairs: Vec<Vec<(u32, u32)>> = Vec::new();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (tasks, next, insert) = (&tasks, &next, &insert);
+                s.spawn(move || {
+                    let mut out = Vec::new();
+                    let mut inserted = 0usize;
+                    loop {
+                        let t = next.fetch_add(1, Relaxed);
+                        let Some(&(v, start, end)) = tasks.get(t) else { break };
+                        let p = &pairs[v][start..end];
+                        let mut sp = Vec::with_capacity(p.len());
+                        for (j, &(a, b)) in p.iter().enumerate() {
+                            if let Some(&(x, y)) = p.get(j + L) {
+                                prefetch(slots.as_ptr().wrapping_add(home(x)));
+                                prefetch(slots.as_ptr().wrapping_add(home(y)));
+                            }
+                            sp.push((insert(a, &mut inserted), insert(b, &mut inserted)));
+                        }
+                        out.push(sp);
+                    }
+                    (out, inserted)
+                })
+            })
+            .collect();
+        for h in handles {
+            let (out, inserted) = h.join().unwrap();
+            slot_pairs.extend(out);
+            nodes += inserted;
+        }
+    });
+
+    // 2. unions, the slots of pair j + L prefetched
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            let (slot_pairs, next, find) = (&slot_pairs, &next, &find);
+            s.spawn(move || loop {
+                let t = next.fetch_add(1, Relaxed);
+                let Some(sp) = slot_pairs.get(t) else { break };
+                for (j, &(a, b)) in sp.iter().enumerate() {
+                    if let Some(&(x, y)) = sp.get(j + L) {
+                        prefetch(slots.as_ptr().wrapping_add(x as usize));
+                        prefetch(slots.as_ptr().wrapping_add(y as usize));
+                    }
+                    loop {
+                        let (ra, rb) = (find(a as usize), find(b as usize));
+                        if ra == rb {
+                            break;
+                        }
+                        let (ka, kb) = (slots[ra][0].load(Relaxed), slots[rb][0].load(Relaxed));
+                        let (child, top) = if key::cmp(ka, kb) == Ordering::Greater { (ra, rb) } else { (rb, ra) };
+                        if slots[child][1].compare_exchange(0, top as u64 + 1, Relaxed, Relaxed).is_ok() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // 3. every node straight to its root; 4. every second word becomes the name, and
+    //    each renamed key gets its filter bit
+    let per_node = std::env::var("SS_FILTER").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).max(1);
+    let bits = (nodes * per_node).next_power_of_two().max(64);
+    let filter: &'static mut [u64] = crate::arena::zeroed_slice(bits / 64);
+    let shift = 64 - bits.trailing_zeros();
+    // SAFETY: as for the slots.
+    let filter_atomic: &[AtomicU64] = unsafe { std::slice::from_raw_parts(filter.as_mut_ptr() as *const AtomicU64, filter.len()) };
+    let ranges: Vec<(usize, usize)> = (0..size).step_by(1 << 16).map(|s| (s, (s + (1 << 16)).min(size))).collect();
+    for step in 0..2 {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let (ranges, next, find) = (&ranges, &next, &find);
+                s.spawn(move || loop {
+                    let r = next.fetch_add(1, Relaxed);
+                    let Some(&(start, end)) = ranges.get(r) else { break };
+                    for i in start..end {
+                        let key = slots[i][0].load(Relaxed);
+                        if key == 0 {
+                            continue;
+                        }
+                        if step == 0 {
+                            let root = find(i);
+                            if root != i {
+                                slots[i][1].store(root as u64 + 1, Relaxed);
+                            }
+                        } else {
+                            let name = match slots[i][1].load(Relaxed) {
+                                0 => key,
+                                w => slots[(w - 1) as usize][0].load(Relaxed),
+                            };
+                            slots[i][1].store(name, Relaxed);
+                            if name != key {
+                                let b = (mix(key) >> shift) as usize;
+                                filter_atomic[b / 64].fetch_or(1 << (b % 64), Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    names.filter = filter;
+    names.shift = shift;
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The parallel build gives every key the same name (and lookup region) as the serial one.
+    #[test]
+    fn parallel_build_matches_serial() {
+        for round in 0..40u64 {
+            let mut s = 0x9e37_79b9_7f4a_7c15 ^ round.wrapping_mul(0x1234_5678_9abc_def1);
+            let n = 20 + round as usize * 53;
+            let ids: Vec<u64> = (0..n)
+                .map(|i| match rng(&mut s) % 7 {
+                    0 => key::key(format!("U{i}").as_bytes()),
+                    1 => key::key(format!("u{i} ").as_bytes()),
+                    2 => key::key(format!("long_user_identifier_{i}").as_bytes()),
+                    _ => key::key(format!("u{}", rng(&mut s) % 1_000_000).as_bytes()),
+                })
+                .collect();
+            let mut pairs: Vec<Vec<(u64, u64)>> = vec![Vec::new(); 4];
+            for k in 0..(n * (1 + round as usize % 3)) {
+                let a = ids[(rng(&mut s) % n as u64) as usize];
+                let b = if k % 7 == 0 { a } else { ids[(rng(&mut s) % n as u64) as usize] };
+                pairs[k % 4].push((a, b));
+            }
+            for k in 1..n.min(300) {
+                pairs[k % 4].push((ids[k - 1], ids[k])); // a long chain
+            }
+            let serial = build(&pairs);
+            let parallel = build_parallel(&pairs, 1 + round as usize % 8);
+            for &id in &ids {
+                assert_eq!(parallel.get(id), serial.get(id), "round {round}");
+                assert_eq!(parallel.region(id, 7), serial.region(id, 7));
+            }
+            for x in [key::key(b"u999999999"), key::key(b"zz")] {
+                assert_eq!(parallel.get(x), serial.get(x));
+            }
+        }
+    }
+}

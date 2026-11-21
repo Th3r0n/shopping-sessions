@@ -12,12 +12,10 @@ mod arena;
 mod csv;
 mod events;
 mod hash;
-mod ids;
 mod input;
 mod key;
 mod links;
 mod lookups;
-mod names;
 mod output;
 mod sessions;
 mod stats;
@@ -145,18 +143,24 @@ fn main() {
     });
     log(&format!("links parsed: {} pairs", link_pairs.iter().map(Vec::len).sum::<usize>()));
 
-    // Phase 1b: names on thread 0, events and clicks everywhere.
+    // Phase 1b: the names on every thread (SS_NAMES=serial: on thread 0 while the
+    // others start parsing), then events and clicks everywhere.
+    let names_cell: std::sync::OnceLock<links::Names> = std::sync::OnceLock::new();
+    let serial_names = std::env::var("SS_NAMES").as_deref() == Ok("serial");
+    if !serial_names {
+        let _ = names_cell.set(links::build_parallel(&link_pairs, threads));
+        log("names built");
+    }
     let event_chunks = event_input.chunks(chunk_size);
     let click_chunks = click_input.chunks(chunk_size);
     let total_chunks = event_chunks.len() + click_chunks.len();
-    // Arena room per thread: thread 0 spends a while on the names, so the others
-    // each parse about 1/(threads-1) of the data. Untouched room costs nothing.
-    let busy = threads.saturating_sub(1).max(1);
+    // Arena room per thread: with serial names thread 0 spends a while on them, so
+    // the others each parse about 1/(threads-1) of the data. Untouched room costs nothing.
+    let busy = if serial_names { threads.saturating_sub(1).max(1) } else { threads };
     let est_clicks = click_bytes / 45 + 1;
     let event_room = est_copies * 13 / 10 / busy;
     let click_room = est_clicks * 13 / 10 / busy;
     let next = AtomicUsize::new(0);
-    let names_cell: std::sync::OnceLock<links::Names> = std::sync::OnceLock::new();
     let mut event_parts: Vec<events::Copies> = Vec::with_capacity(threads);
     let mut person_clicks: Vec<Words3> = Vec::with_capacity(threads);
     let mut deferred_clicks: Vec<Words3> = Vec::with_capacity(threads);
@@ -166,7 +170,7 @@ fn main() {
                 let (event_chunks, click_chunks, event_input, click_input, next, cx, link_pairs, names_cell) =
                     (&event_chunks, &click_chunks, &event_input, &click_input, &next, &cx, &link_pairs, &names_cell);
                 s.spawn(move || {
-                    if t == 0 {
+                    if t == 0 && names_cell.get().is_none() {
                         let started = std::time::Instant::now();
                         let _ = names_cell.set(links::build(link_pairs));
                         if stats::enabled() {
