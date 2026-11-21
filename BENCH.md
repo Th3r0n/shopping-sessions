@@ -56,3 +56,9 @@ scatter into 1024 partitions 54.1 (1.16 s for 21.5 M lines).
 Current binary, `NCPU=1`, same scope (events parsed - names built 0.085 s, + deduplicated 0.46 s + names resolved
 0.12 s), still including the 5.1 M click lines and the mmap faults: 2.1-2.5 s, so about 1.7-1.9 times the prototype.
 The prototype leaves out the dedup resolution pass, real name probes, exotic interning and file boundaries.
+
+## Tokenizer, p20, one thread (proto levels 10/11 run src/input.rs on the same buffer)
+
+Current `simd_range` 19.4 ns/line (with ts::ingest + ts::parse: 30.4); prototype stages 1-2 12.8 ns/line (with
+both base 36 IDs and the SSE F1 path: 29.0; with src/ts.rs instead of f1_fast: 32.9). So step 2 would save about
+10 ns/line, ~0.2 s of CPU at 20M (~0.045 s wall, ~5%), not the 8-10% expected: postponed to the tuning step.

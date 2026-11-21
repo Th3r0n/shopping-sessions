@@ -39,6 +39,10 @@
 
 #[path = "../../src/ts.rs"]
 mod ts;
+#[path = "../../src/csv.rs"]
+mod csv;
+#[path = "../../src/input.rs"]
+mod input;
 
 use std::arch::x86_64::*;
 use std::time::Instant;
@@ -634,7 +638,23 @@ fn main() {
         let mut bitmap = vec![0u64; bitmap_bits / 64];
         let mut out = Scatter::new(1024, lines_estimate);
         let started = Instant::now();
-        let counts = unsafe { run(&buf, data_len, level, &shape, &names, &mut bitmap, &mut out) };
+        let counts = if level >= 10 {
+            // the current pipeline's tokenizer (src/input.rs) on the same buffer
+            let mut o = Counts::default();
+            let data = &buf[PAD_FRONT..];
+            let mut f = |x: &[&[u8]; 7]| {
+                o.good += 1;
+                o.sum += (x[0].len() + x[6].len()) as u64;
+                if level >= 11 {
+                    o.sum += ts::ingest(x[3]) as u64 + ts::parse(x[2]).unwrap_or(0) as u64;
+                }
+            };
+            input::range_lines::<7, _>(data, 0, data_len, data_len, true, &mut f);
+            o.lines = o.good;
+            o
+        } else {
+            unsafe { run(&buf, data_len, level, &shape, &names, &mut bitmap, &mut out) }
+        };
         best = best.min(started.elapsed().as_secs_f64());
         last = counts;
     }
