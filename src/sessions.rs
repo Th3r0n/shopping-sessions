@@ -214,7 +214,7 @@ pub fn dedup(
     }
 }
 
-const LAG: usize = 16;
+const LAG: usize = 24;
 
 #[derive(Clone, Copy)]
 pub struct Shape {
