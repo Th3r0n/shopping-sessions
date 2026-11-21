@@ -88,7 +88,7 @@ fn main() {
     let est_copies = event_bytes / 75 + 1;
     let eid_parts = env_usize("SS_EID_PARTS")
         .or_else(|| env_usize("SS_PARTS"))
-        .unwrap_or((est_copies / 8_192).clamp(1, 8192))
+        .unwrap_or((est_copies / 8_192).clamp(1, 4096))
         .max(1);
     let person_parts = env_usize("SS_PERSON_PARTS")
         .or_else(|| env_usize("SS_PARTS"))
