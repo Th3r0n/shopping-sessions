@@ -11,6 +11,13 @@ Parquet tables `/output/user_daily/` and `/output/campaign_daily/`, following `r
   it as it goes, and re-runs itself in an exact generic mode when the data breaks its assumptions.
   Our changes to it are in the git history after the commit that imports it. It needs AVX-512
   (built for Cascade Lake, the scorer's CPU).
+- **Our changes to it** (measured on the scorer with `probe/`, see BENCH.md):
+  - every thread releases its share of the big arrays and of the allocator heap before exit (the
+    `XL_ENDREL=2` path, now the default), instead of the kernel tearing it all down on one core at
+    exit: about 25 ms less per run;
+  - a fix in that path: it no longer releases the input range after stage45 has unmapped it (that
+    zeroed whatever had been mapped there since: crashes and hangs);
+  - `XL_COREFIRST=1`, an optional core-first CPU order for the pinned threads (off by default).
 - **Profile-guided optimization, tried and dropped.** `scripts/pgo/` builds an instrumented pipeline
   (feature `pgo-gen`) and merges its profile on never-scored generator seeds; a scorer A/B (BENCH.md,
   P8) found no measurable gain, so the image is built without it.

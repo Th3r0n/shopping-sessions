@@ -143,3 +143,11 @@ at AB_BASE + AB_SCALE x (A - B) seconds (10 + 100 x by default).
 | scorer probe | commit | variants | score | reading |
 | --- | --- | --- | --- | --- |
 | P8 ab-pgo | df71ca5 | A = PGO build, B = same source without; ends at 10 + 100 x (A - B) | 10.15 s | A - B ~ 0 (at most +1.5 ms with ~0.15 s fixed cost): PGO dropped |
+| P9 ab-env | ab4e018 | V0 defaults, V1 XL_ENDREL=2, V2 XL_ENDREL=1, V3 XL_COREFIRST=1; ends at 8 + 2.5 k + gain/10 ms | 13.10 s | k = 1 (XL_ENDREL=2), gain >= ~24 ms (at the 24.9 ms cap) |
+
+XL_ENDREL=2 makes every thread release its share of the big arrays, of the allocator heap and of the input
+mapping before exit; by default (unset) the scorer releases nothing and the kernel tears it all down on one
+core at exit. But stage45 already unmaps the input mapping (REGION_UNMAP, on by default), so the release of
+that old range hits whatever was mapped there since: under SDE at NCPU=3 every run crashed or hung (7/7),
+at NCPU=8 a p20 run hung once. Releasing only the arrays and the heap: 3/3 fine at NCPU=3. Our version makes
+"2" the default and releases the input range only while it is still mapped (out::REGION_UNMAPPED).

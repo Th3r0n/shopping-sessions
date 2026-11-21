@@ -446,7 +446,15 @@ fn main() {
     }
     #[cfg(feature = "tl")]
     let rel0 = sys::tl::now();
-    let endrel = std::env::var("XL_ENDREL").ok();
+    // Default "2": every thread releases its share of the big arrays and of the allocator
+    // heap before exit, instead of the kernel tearing it all down on one core at exit.
+    // Scorer A/B (BENCH.md, P9): about 25 ms faster per run than the old default (unset).
+    // XL_ENDREL=auto restores the old heuristic, 0 or 1 its other settings.
+    let endrel = match std::env::var("XL_ENDREL") {
+        Ok(v) if v == "auto" => None,
+        Ok(v) => Some(v),
+        Err(_) => Some("2".to_string()),
+    };
     let many_faults = endrel.is_none() && sys::minflt(0) as usize > 2 * (g.files.last().map_or(0, |f| f.off + f.len) >> 16) + 60_000;
     if ((sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) || many_faults) && endrel.as_deref().map_or(true, |v| v == "1")) || endrel.as_deref() == Some("2") {
         let nt = g.nt;
@@ -466,7 +474,10 @@ fn main() {
                 v(c.cat.as_ptr(), c.cat.len()),
                 v(t.edge.as_ptr() as *const u8, t.edge.len() * 16),
                 if g.csr.is_null() { (0, 0) } else { v((g.csr as *const u8).wrapping_add(g.ncsr * 16 * tid / nt), g.ncsr * 16 * (tid + 1) / nt - g.ncsr * 16 * tid / nt) },
-                if endrel.as_deref() == Some("2") { let tot = g.files.last().map_or(0, |f| f.off + f.len); v(g.region.wrapping_add(tot * tid / nt), tot * (tid + 1) / nt - tot * tid / nt) } else { (0, 0) },
+                // The input mapping, only while it is still mapped: stage45 normally unmaps it
+                // already, and a release of the old range would hit whatever has been mapped
+                // there since (a crash or a hang: seen under SDE at NCPU=3).
+                if endrel.as_deref() == Some("2") && !out::REGION_UNMAPPED.load(std::sync::atomic::Ordering::Acquire) { let tot = g.files.last().map_or(0, |f| f.off + f.len); v(g.region.wrapping_add(tot * tid / nt), tot * (tid + 1) / nt - tot * tid / nt) } else { (0, 0) },
                 (0, 0),
             ];
         }

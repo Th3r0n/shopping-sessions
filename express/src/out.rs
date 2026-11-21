@@ -483,6 +483,8 @@ fn cut_guided(rows: &[(usize, usize)], nt: usize) -> Vec<(usize, usize, usize)> 
 }
 
 pub static REGION_UNMAP: AtomicBool = AtomicBool::new(true);
+/// Set once stage45 has unmapped the input region (main must not release it after that).
+pub static REGION_UNMAPPED: AtomicBool = AtomicBool::new(false);
 
 pub fn stage45(g: &mut G, outdir: &str) {
     crate::complex::stage4_pre(g);
@@ -543,6 +545,7 @@ pub fn stage45(g: &mut G, outdir: &str) {
                         fn munmap(p: *mut u8, n: usize) -> i32;
                     }
                     unsafe { munmap(gr.region as *mut u8, rg_len) };
+                    REGION_UNMAPPED.store(true, Ordering::Release);
                     continue;
                 }
                 if pq.load(Ordering::Relaxed) < np {
