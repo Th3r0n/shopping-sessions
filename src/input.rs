@@ -137,6 +137,17 @@ impl Input {
         self.lens.iter().sum()
     }
 
+    /// Probe only: seconds to map the first 64 MiB of the largest file (slow when
+    /// the page cache does not hold it yet).
+    pub fn probe_cold(&self) -> f64 {
+        let Some((file, _)) = self.lens.iter().enumerate().max_by_key(|&(_, &l)| l) else { return 0.0 };
+        let Some(map) = self.maps.get(file) else { return 0.0 };
+        let n = map.len().min(64 << 20);
+        let started = std::time::Instant::now();
+        populate(&map[..n]);
+        started.elapsed().as_secs_f64()
+    }
+
     /// The position just after the first `\n` at or after `from`, or the file length.
     fn next_line_start(&self, file: usize, from: u64) -> u64 {
         let len = self.lens[file];

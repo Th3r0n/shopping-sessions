@@ -17,6 +17,7 @@ mod key;
 mod links;
 mod lookups;
 mod output;
+mod probe;
 mod prof;
 mod sessions;
 mod stats;
@@ -62,6 +63,8 @@ fn main() {
     if std::env::var_os("SS_NOOP").is_some() {
         std::process::exit(0); // measures the fixed cost of starting and stopping the container
     }
+    let started = std::time::Instant::now();
+    let probe_mode = probe::mode();
     let mut stats = stats::Stats::new();
     let mut log = |what: &str| stats.log(what);
     let args: Vec<String> = std::env::args().collect();
@@ -85,6 +88,7 @@ fn main() {
     let event_input = input::Input::open(&data.join("events"));
     let click_input = input::Input::open(&data.join("clicks"));
     let link_input = input::Input::open(&data.join("links"));
+    let cold = if probe_mode.as_deref() == Some("env") { event_input.probe_cold() } else { 0.0 };
     let event_bytes = event_input.bytes() as usize;
     let click_bytes = click_input.bytes() as usize;
     let simd = input::use_simd();
@@ -472,6 +476,9 @@ fn main() {
         String::new()
     };
     log(&format!("written; peak RSS {peak}"));
+    if let Some(mode) = &probe_mode {
+        probe::finish(mode, started.elapsed().as_secs_f64(), cold, threads);
+    }
     prof::report();
     // Give the memory back on every thread, then leave without the serial teardown.
     if std::env::var("SS_RELEASE").as_deref() != Ok("0") {
