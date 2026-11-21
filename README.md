@@ -3,7 +3,18 @@
 A single static Rust binary that turns the dirty click-stream CSVs in `/data` into the two exact daily
 Parquet tables `/output/user_daily/` and `/output/campaign_daily/`, following `rules.md`.
 
-## How it works
+## Credits and layout
+
+- **`express/`: the pipeline in the image.** It is based on Team 67's Express Lane
+  (github.com/jason-scheffel/express-lane, commit 92cf412), used under the MIT License; Team 67's
+  copyright notice is kept in `LICENSE`. It infers a compact ID representation from the input, checks
+  it as it goes, and re-runs itself in an exact generic mode when the data breaks its assumptions.
+  Our changes to it are in the git history after the commit that imports it. It needs AVX-512
+  (built for Cascade Lake, the scorer's CPU).
+- **`src/`, `generic/`: our own earlier pipeline** (scored 1.01 s, commit 14b4668), described below.
+  It is kept in the repository and its tests, but it is not in the image.
+
+## Our earlier pipeline (`src/`)
 
 All phases run on `NCPU` threads over memory-mapped inputs split into line-aligned chunks.
 
