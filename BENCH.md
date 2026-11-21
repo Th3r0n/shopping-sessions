@@ -62,3 +62,31 @@ The prototype leaves out the dedup resolution pass, real name probes, exotic int
 Current `simd_range` 19.4 ns/line (with ts::ingest + ts::parse: 30.4); prototype stages 1-2 12.8 ns/line (with
 both base 36 IDs and the SSE F1 path: 29.0; with src/ts.rs instead of f1_fast: 32.9). So step 2 would save about
 10 ns/line, ~0.2 s of CPU at 20M (~0.045 s wall, ~5%), not the 8-10% expected: postponed to the tuning step.
+
+## Step 3 as planned (branch v2-bitmap): exact, but slower
+
+One scatter by person, dedup by a shared bitmap of event values, names looked up at parse. Exact on dev and
+p20, but p20 parse 0.44 s (v1 0.30) and p60 parse 3.5 s with 6 s of system time: every copy does a random
+read-modify-write in a 128-256 MB bitmap and 40% a random name lookup, which cost more than v1's sequential
+scatters. With an L2-sized bitmap (wrong dedup, timing only) parse is still 0.395 s. Abandoned.
+
+## What went in instead (internal time, p20, vs d1b54d3 = scored 1.07 s)
+
+| change | effect |
+| --- | --- |
+| names built on all threads before parsing (5b99a0d) | p20 -2.6%, p60 neutral (0.95 s on thread 0 -> 0.15 s on 8) |
+| 2 MiB chunks | -2.0% (1 MiB: +2.6%) |
+| 3 name slots per link (instead of 5) | -1.3% |
+| two-stage tokenizer (2d430f9) | 19.4 -> 15.6 ns/line one thread, parse -4% |
+| INT32 integer columns (728f313) | user_daily 92 -> 67 MB |
+| cumulative (728f313) | p20 -4.0% (median of diffs) / -4.7% (medians); p60 -3.6% |
+
+Measured and dropped: counting sort by rank + per-person sort in sessions (+9%), SSE F1 (0), one-multiply eid
+hash (0), SS_IO=pread (+23%), lazy input faults (0), SS_DROP=0 (+1%), eid partitions 1344/4096, person
+partitions 1344, names filter 4 or 16 bits per node (all within noise).
+
+Disk vs tmpfs /output: v1-baseline +0.36 s, current +0.10 s (the parallel release and _exit removed most of it).
+
+Profile at 20M (SS_PROFILE=1, seconds summed over 8 threads): dedup insert 0.27, kept 0.06, route 0.34;
+sessions rank 0.19, sort 0.36, person 0.39. Names at 60M: inserts 0.069 s, unions 0.024, roots 0.024,
+names 0.019 (34k 4 KiB faults: no transparent huge pages available in the VM at that point).

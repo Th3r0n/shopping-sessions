@@ -338,6 +338,8 @@ pub fn build_parallel(pairs: &[Vec<(u64, u64)>], threads: usize) -> Names {
         .collect();
     let threads = threads.clamp(1, tasks.len().max(1));
 
+    let clock = std::time::Instant::now();
+    let mut laps = Vec::new();
     // 1. every endpoint into the table, prefetched L pairs ahead
     let next = AtomicUsize::new(0);
     let mut nodes = 0usize;
@@ -374,6 +376,7 @@ pub fn build_parallel(pairs: &[Vec<(u64, u64)>], threads: usize) -> Names {
         }
     });
 
+    laps.push(clock.elapsed().as_secs_f64());
     // 2. unions, the slots of pair j + L prefetched
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
@@ -403,6 +406,7 @@ pub fn build_parallel(pairs: &[Vec<(u64, u64)>], threads: usize) -> Names {
         }
     });
 
+    laps.push(clock.elapsed().as_secs_f64());
     // 3. every node straight to its root; 4. every second word becomes the name, and
     //    each renamed key gets its filter bit
     let per_node = std::env::var("SS_FILTER").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).max(1);
@@ -445,6 +449,10 @@ pub fn build_parallel(pairs: &[Vec<(u64, u64)>], threads: usize) -> Names {
                 });
             }
         });
+        laps.push(clock.elapsed().as_secs_f64());
+    }
+    if crate::stats::enabled() {
+        eprintln!("           names: {nodes} nodes, {size} slots; inserts {:.3}s, unions {:.3}s, roots {:.3}s, names {:.3}s", laps[0], laps[1] - laps[0], laps[2] - laps[1], laps[3] - laps[2]);
     }
     names.filter = filter;
     names.shift = shift;
