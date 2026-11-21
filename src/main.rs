@@ -164,38 +164,51 @@ fn main() {
     // Arena room per thread: with serial names thread 0 spends a while on them, so
     // the others each parse about 1/(threads-1) of the data. Untouched room costs nothing.
     let busy = if serial_names { threads.saturating_sub(1).max(1) } else { threads };
-    if let Some(rounds) = env_usize("SS_PARSEBENCH") {
-        // Benchmark only: the events parse alone, `rounds` times on every thread; the
-        // fastest round is printed and the process ends.
+    // Benchmark and probe only: the events parse alone, once on every thread.
+    let parse_round = |input: &input::Input, chunks: &[input::Chunk]| -> f64 {
         let room = est_copies * 13 / 10 / threads;
-        let mut best = f64::MAX;
-        for _ in 0..rounds.max(1) {
-            let next = AtomicUsize::new(0);
-            let started = std::time::Instant::now();
-            std::thread::scope(|s| {
-                for _ in 0..threads {
-                    let (event_chunks, event_input, next, cx) = (&event_chunks, &event_input, &next, &cx);
-                    s.spawn(move || {
-                        let mut parts = events::Copies {
-                            compact: Words3::new(eid_parts, room),
-                            full: Scatter::new(eid_parts, est_copies / threads / 16, room / 8),
-                        };
-                        let mut buf = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(c) = event_chunks.get(i) else { break };
-                            event_input.parse::<7, _>(c, &mut buf, simd, &mut |f| events::event_fields(f, cx, &mut parts));
-                        }
-                        parts.compact.finish();
-                        parts.full.finish();
-                        std::hint::black_box(parts.compact.total() + parts.full.total());
-                    });
-                }
-            });
-            best = best.min(started.elapsed().as_secs_f64());
-        }
+        let next = AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let (next, cx) = (&next, &cx);
+                s.spawn(move || {
+                    let mut parts = events::Copies {
+                        compact: Words3::new(eid_parts, room),
+                        full: Scatter::new(eid_parts, est_copies / threads / 16, room / 8),
+                    };
+                    let mut buf = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(c) = chunks.get(i) else { break };
+                        input.parse::<7, _>(c, &mut buf, simd, &mut |f| events::event_fields(f, cx, &mut parts));
+                    }
+                    parts.compact.finish();
+                    parts.full.finish();
+                    std::hint::black_box(parts.compact.total() + parts.full.total());
+                });
+            }
+        });
+        started.elapsed().as_secs_f64()
+    };
+    if let Some(rounds) = env_usize("SS_PARSEBENCH") {
+        // the fastest of `rounds` rounds is printed and the process ends
+        let best = (0..rounds.max(1)).map(|_| parse_round(&event_input, &event_chunks)).fold(f64::MAX, f64::min);
         eprintln!("parsebench: events parsed in {best:.4}s (best of {rounds})");
         exit_now();
+    }
+    if probe_mode.as_deref() == Some("ab-io") {
+        // the same parse from memory maps (A) and with pread (B), alternated
+        std::env::set_var("SS_IO", "pread");
+        let pread_input = input::Input::open(&data.join("events"));
+        std::env::remove_var("SS_IO");
+        let pread_chunks = pread_input.chunks(chunk_size);
+        let (mut a, mut b) = (f64::MAX, f64::MAX);
+        for _ in 0..2 {
+            a = a.min(parse_round(&event_input, &event_chunks));
+            b = b.min(parse_round(&pread_input, &pread_chunks));
+        }
+        probe::set_ab(a, b);
     }
     let est_clicks = click_bytes / 45 + 1;
     let event_room = est_copies * 13 / 10 / busy;
