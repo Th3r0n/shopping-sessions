@@ -206,6 +206,12 @@ fn main() {
         }
     });
     let names = names_cell.get().expect("names were built");
+    if std::env::var("SS_EARLY_UNMAP").as_deref() != Ok("0") {
+        // Unmapping gigabytes of 4 KiB file pages takes a while: do it now, in the
+        // background, rather than at exit.
+        let inputs = (event_input, click_input, link_input);
+        std::thread::spawn(move || drop(inputs));
+    }
     log(&format!(
         "events parsed: {} copies, {} valid clicks",
         event_parts.iter().map(Scatter::total).sum::<usize>(),
