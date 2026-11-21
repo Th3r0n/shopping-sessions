@@ -233,9 +233,12 @@ pub struct Acc {
     pub events: Vec<i64>,
     pub revenue: Vec<i64>,
     pub top: Vec<u16>,
-    /// `[(campaign + 1) * days + day]`: credited sessions, purchasing sessions,
-    /// revenue, assisted sessions. Index 0 is `organic`.
-    pub stats: Vec<[i64; 4]>,
+    /// Day-major, `[day * (campaigns + 1) + campaign + 1]` (index 0 of a row is
+    /// `organic`): credited sessions, purchasing sessions and revenue, then assisted
+    /// sessions apart. A session's updates all land in its day's rows, which stay
+    /// in cache. `add_stats` merges them.
+    pub credited: Vec<(u32, u32, i64)>,
+    pub assists: Vec<u32>,
     shape: Shape,
     count: Vec<u32>,
     pos: Vec<u32>,
@@ -261,7 +264,8 @@ impl Acc {
             events: huge_vec(rows),
             revenue: huge_vec(rows),
             top: huge_vec(rows),
-            stats: vec![[0; 4]; (shape.campaigns + 1) * shape.days],
+            credited: vec![(0, 0, 0); (shape.campaigns + 1) * shape.days],
+            assists: vec![0; (shape.campaigns + 1) * shape.days],
             shape,
             count: vec![0; shape.campaigns],
             pos: vec![u32::MAX; shape.campaigns],
@@ -273,6 +277,22 @@ impl Acc {
             cls_tmp: Vec::new(),
             persons: Vec::new(),
             ranks: Ranks::default(),
+        }
+    }
+
+    /// `[(campaign + 1) * days + day]`: credited sessions, purchasing sessions,
+    /// revenue, assisted sessions, added into `total`. Index 0 is `organic`.
+    pub fn add_stats(&self, total: &mut [[i64; 4]]) {
+        let (days, width) = (self.shape.days, self.shape.campaigns + 1);
+        for d in 0..days {
+            for c in 0..width {
+                let (sessions, purchasing, revenue) = self.credited[d * width + c];
+                let t = &mut total[c * days + d];
+                t[0] += sessions as i64;
+                t[1] += purchasing as i64;
+                t[2] += revenue;
+                t[3] += self.assists[d * width + c] as i64;
+            }
         }
     }
 
@@ -379,7 +399,6 @@ impl Acc {
     /// One person's events (sorted by ts) and valid clicks (sorted by ts).
     #[inline(never)]
     fn person(&mut self, person: u64, evs: &[PersonEvent], cls: &[PersonClick]) {
-        let days = self.shape.days;
         let first_day = self.shape.first_day;
         let base = self.shape.base;
         let (mut lo, mut hi) = (0usize, 0usize);
@@ -442,17 +461,18 @@ impl Acc {
                         best = b;
                     }
                 }
+                let row = &mut self.assists[di * (self.shape.campaigns + 1)..(di + 1) * (self.shape.campaigns + 1)];
                 for &c in &self.active {
-                    self.stats[(c as usize + 1) * days + di][3] += 1;
+                    row[c as usize + 1] += 1;
                 }
                 cls[best].campaign as usize + 1
             } else {
                 0
             };
-            let s = &mut self.stats[credited * days + di];
-            s[0] += 1;
-            s[1] += purchased as i64;
-            s[2] += revenue;
+            let s = &mut self.credited[di * (self.shape.campaigns + 1) + credited];
+            s.0 += 1;
+            s.1 += purchased as u32;
+            s.2 += revenue;
             k = end;
         }
         if current_day != i64::MIN {
