@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 
 use crate::arena::Scatter;
-use crate::events::{EventCopy, PURCHASE, RESOLVED, SURVIVES, WEEK};
+use crate::events::{category_of, price_of, ts_of, EventCopy, PURCHASE, RESOLVED, SURVIVES, WEEK};
 use crate::hash::{bucket, mix};
 use crate::key;
 use crate::links::Names;
@@ -17,18 +17,17 @@ pub const NO_CATEGORY: u16 = u16::MAX;
 #[repr(C)]
 pub struct PersonEvent {
     pub person: u64,
-    pub ts: i64,
-    pub price: u32,
-    pub category: u16,
-    pub flags: u8,
+    /// As in EventCopy (see events::pack).
+    pub packed: u64,
 }
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct PersonClick {
     pub person: u64,
-    pub ts: i64,
     pub click_id: u64,
+    /// Relative to Context::base.
+    pub ts: u32,
     pub campaign: u32,
 }
 
@@ -97,15 +96,12 @@ pub fn dedup(
             continue;
         }
         let c = copy_at(s.at);
-        if c.flags & SURVIVES != 0 {
+        if c.packed & SURVIVES != 0 {
             let e = PersonEvent {
                 person: c.user,
-                ts: c.ts,
-                price: c.price,
-                category: c.category,
-                flags: c.flags,
+                packed: c.packed,
             };
-            if c.flags & RESOLVED != 0 {
+            if c.packed & RESOLVED != 0 {
                 out.push(bucket(mix(e.person), out.parts()), e);
             } else {
                 kept.push(e);
@@ -129,6 +125,8 @@ const LAG: usize = 16;
 
 #[derive(Clone, Copy)]
 pub struct Shape {
+    /// Context::base: ts values in records are relative to it.
+    pub base: i64,
     pub first_day: i64,
     pub days: usize,
     pub campaigns: usize,
@@ -191,7 +189,7 @@ impl Acc {
         for part in cls {
             c.extend_from_slice(part);
         }
-        e.sort_unstable_by_key(|x| (x.person, x.ts));
+        e.sort_unstable_by_key(|x| (x.person, x.packed as u32));
         c.sort_unstable_by_key(|x| (x.person, x.ts));
         let (mut i, mut ci) = (0usize, 0usize);
         while i < e.len() {
@@ -262,18 +260,19 @@ impl Acc {
     fn person(&mut self, person: u64, evs: &[PersonEvent], cls: &[PersonClick]) {
         let days = self.shape.days;
         let first_day = self.shape.first_day;
+        let base = self.shape.base;
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut current_day = i64::MIN;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0i64, 0i64, 0i64);
         self.categories.clear();
         let mut k = 0;
         while k < evs.len() {
-            let start = evs[k].ts;
+            let start = ts_of(evs[k].packed);
             let mut end = k + 1;
-            while end < evs.len() && evs[end].ts - evs[end - 1].ts <= GAP {
+            while end < evs.len() && ts_of(evs[end].packed) - ts_of(evs[end - 1].packed) <= GAP {
                 end += 1;
             }
-            let day = start.div_euclid(DAY);
+            let day = (base + start).div_euclid(DAY);
             if day != current_day {
                 if current_day != i64::MIN {
                     self.flush(person, current_day, day_sessions, day_events, day_revenue);
@@ -287,13 +286,14 @@ impl Acc {
             let mut revenue = 0i64;
             let mut purchased = false;
             for e in &evs[k..end] {
-                if e.flags & PURCHASE != 0 {
-                    let cents = e.price as i64;
+                if e.packed & PURCHASE != 0 {
+                    let cents = price_of(e.packed) as i64;
+                    let category = category_of(e.packed);
                     revenue += cents;
                     purchased = true;
-                    match self.categories.iter_mut().find(|c| c.0 == e.category) {
+                    match self.categories.iter_mut().find(|c| c.0 == category) {
                         Some(c) => c.1 += cents,
-                        None => self.categories.push((e.category, cents)),
+                        None => self.categories.push((category, cents)),
                     }
                 }
             }
@@ -301,12 +301,12 @@ impl Acc {
             day_events += (end - k) as i64;
             day_revenue += revenue;
 
-            while hi < cls.len() && cls[hi].ts <= start {
+            while hi < cls.len() && cls[hi].ts as i64 <= start {
                 self.enter(cls[hi].campaign);
                 hi += 1;
             }
             let low = start - WEEK;
-            while lo < hi && cls[lo].ts < low {
+            while lo < hi && (cls[lo].ts as i64) < low {
                 self.leave(cls[lo].campaign);
                 lo += 1;
             }

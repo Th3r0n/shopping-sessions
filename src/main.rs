@@ -31,6 +31,26 @@ use output::Column;
 use sessions::{Acc, PersonClick, PersonEvent, Shape, NO_CATEGORY};
 use ts::DAY;
 
+/// Hands the whole run to the generic binary next to this one.
+fn run_generic(args: &[String]) -> ! {
+    let exe = std::env::current_exe().expect("current_exe");
+    let generic = exe.with_file_name(format!("shopping-sessions-generic{}", std::env::consts::EXE_SUFFIX));
+    eprintln!("running {}", generic.display());
+    let mut command = std::process::Command::new(&generic);
+    command.args(&args[1..]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        panic!("exec {}: {error}", generic.display());
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status().expect("running the generic binary");
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.trim().parse().ok()
 }
@@ -74,7 +94,18 @@ fn main() {
         link_input.files.len()
     ));
 
+    // The compact records need every kept ts within 2^32 ms of base and at most
+    // 32 categories; anything else (never produced by the generator) goes to the
+    // generic binary, which has none of these limits.
+    let base = window.start - events::WEEK;
+    let compact_ok = window.end > window.start
+        && window.end - base <= u32::MAX as i64
+        && products.categories.len() <= events::MAX_CATEGORIES;
+    if !compact_ok || std::env::var_os("SS_FORCE_GENERIC").is_some() {
+        run_generic(&args);
+    }
     let cx = Context {
+        base,
         window_start: window.start,
         window_end: window.end,
         products: &products,
@@ -208,6 +239,7 @@ fn main() {
     let first_day = window.start.div_euclid(DAY);
     let last_day = (window.end - 1).div_euclid(DAY);
     let shape = Shape {
+        base,
         first_day,
         days: (last_day - first_day + 1).max(1) as usize,
         campaigns: campaigns.ids.len(),

@@ -8,10 +8,32 @@ use crate::sessions::PersonClick;
 use crate::lookups::{Campaigns, Products};
 use crate::ts::{self, DAY};
 
-pub const SURVIVES: u8 = 1;
-pub const PURCHASE: u8 = 2;
+/// The packed word of an event: ts relative to `Context::base` (bits 0-31), price
+/// (32-55), category (56-60) and flags (61-63). main checks at startup that every
+/// in-window ts fits in 32 bits and every category id in 5; otherwise the generic
+/// binary runs instead.
+pub const SURVIVES: u64 = 1 << 61;
+pub const PURCHASE: u64 = 1 << 62;
 /// `user` already holds the person's name.
-pub const RESOLVED: u8 = 4;
+pub const RESOLVED: u64 = 1 << 63;
+pub const MAX_CATEGORIES: usize = 32;
+
+#[inline]
+pub fn pack(ts_rel: u32, price: u32, category: u16, flags: u64) -> u64 {
+    ts_rel as u64 | (price as u64) << 32 | (category as u64) << 56 | flags
+}
+#[inline]
+pub fn ts_of(packed: u64) -> i64 {
+    packed as u32 as i64
+}
+#[inline]
+pub fn price_of(packed: u64) -> u32 {
+    (packed >> 32) as u32 & 0x00ff_ffff
+}
+#[inline]
+pub fn category_of(packed: u64) -> u16 {
+    (packed >> 56) as u16 & 31
+}
 pub const WEEK: i64 = 7 * DAY;
 
 /// One well-formed copy of an event with a non-empty event_id. `flags` says whether
@@ -23,10 +45,8 @@ pub struct EventCopy {
     pub event_id: u64,
     pub ingest: i64,
     pub user: u64,
-    pub ts: i64,
-    pub price: u32,
-    pub category: u16,
-    pub flags: u8,
+    /// See `pack`; 0 (no flags) for a copy that would not survive.
+    pub packed: u64,
 }
 
 /// A short FIFO of values whose name lookups were prefetched: a value comes out
@@ -72,6 +92,8 @@ impl<T: Copy + Default> Pending<T> {
 }
 
 pub struct Context<'a> {
+    /// window_start - 7 days: every kept ts is stored relative to it.
+    pub base: i64,
     pub window_start: i64,
     pub window_end: i64,
     pub products: &'a Products,
@@ -109,10 +131,7 @@ pub fn event_fields(
         event_id: key::key(event_id),
         ingest: ts::parse(ingest).unwrap_or(i64::MAX),
         user: 0,
-        ts: 0,
-        price: 0,
-        category: 0,
-        flags: 0,
+        packed: 0,
     };
     'valid: {
         if user.is_empty() || product.is_empty() {
@@ -132,22 +151,23 @@ pub fn event_fields(
             Some(t) if t >= cx.window_start && t < cx.window_end => t,
             _ => break 'valid,
         };
+        let (mut cents, mut category) = (0, 0);
         if purchase {
             match price(price_cents) {
-                Some(p) => copy.price = p,
+                Some(p) => cents = p,
                 None => break 'valid,
             }
-            copy.category = cx.products.category(product);
+            category = cx.products.category(product);
         }
         if copy.ingest.saturating_sub(t) > DAY {
             break 'valid;
         }
-        copy.ts = t;
-        copy.flags = SURVIVES | if purchase { PURCHASE } else { 0 };
+        let flags = SURVIVES | if purchase { PURCHASE } else { 0 };
+        copy.packed = pack((t - cx.base) as u32, cents, category, flags);
         copy.user = user_key;
         if let Some(names) = names {
             // Resolved LAG lines later, once the prefetched slot has arrived.
-            copy.flags |= RESOLVED;
+            copy.packed |= RESOLVED;
             if let Some(mut old) = pending.push(copy) {
                 old.user = names.get(old.user);
                 parts.push(bucket(mix(old.event_id), parts.parts()), old);
@@ -190,8 +210,8 @@ pub fn click_fields(
     };
     let click = PersonClick {
         person: user_key,
-        ts: t,
         click_id: key::key(click_id),
+        ts: (t - cx.base) as u32,
         campaign,
     };
     if let Some(mut old) = pending.push(click) {

@@ -6,3 +6,4 @@ dev/
 out/
 *.md
 .git
+generic/target/
