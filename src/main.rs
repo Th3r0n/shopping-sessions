@@ -17,6 +17,7 @@ mod key;
 mod links;
 mod lookups;
 mod output;
+mod prof;
 mod sessions;
 mod stats;
 mod ts;
@@ -157,6 +158,39 @@ fn main() {
     // Arena room per thread: with serial names thread 0 spends a while on them, so
     // the others each parse about 1/(threads-1) of the data. Untouched room costs nothing.
     let busy = if serial_names { threads.saturating_sub(1).max(1) } else { threads };
+    if let Some(rounds) = env_usize("SS_PARSEBENCH") {
+        // Benchmark only: the events parse alone, `rounds` times on every thread; the
+        // fastest round is printed and the process ends.
+        let room = est_copies * 13 / 10 / threads;
+        let mut best = f64::MAX;
+        for _ in 0..rounds.max(1) {
+            let next = AtomicUsize::new(0);
+            let started = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for _ in 0..threads {
+                    let (event_chunks, event_input, next, cx) = (&event_chunks, &event_input, &next, &cx);
+                    s.spawn(move || {
+                        let mut parts = events::Copies {
+                            compact: Words3::new(eid_parts, room),
+                            full: Scatter::new(eid_parts, est_copies / threads / 16, room / 8),
+                        };
+                        let mut buf = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(c) = event_chunks.get(i) else { break };
+                            event_input.parse::<7, _>(c, &mut buf, simd, &mut |f| events::event_fields(f, cx, &mut parts));
+                        }
+                        parts.compact.finish();
+                        parts.full.finish();
+                        std::hint::black_box(parts.compact.total() + parts.full.total());
+                    });
+                }
+            });
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        eprintln!("parsebench: events parsed in {best:.4}s (best of {rounds})");
+        exit_now();
+    }
     let est_clicks = click_bytes / 45 + 1;
     let event_room = est_copies * 13 / 10 / busy;
     let click_room = est_clicks * 13 / 10 / busy;
@@ -364,16 +398,13 @@ fn main() {
                 let rows = acc.user.len();
                 let mut user = Column::strings("user_id", rows);
                 let mut day = Column::dates("day", rows);
-                let mut sessions = Column::int64s("sessions", rows);
-                let mut events = Column::int64s("events", rows);
-                let mut revenue = Column::int64s("revenue_cents", rows);
+                let sessions = Column::integers("sessions", &acc.sessions);
+                let events = Column::integers("events", &acc.events);
+                let revenue = Column::integers("revenue_cents", &acc.revenue);
                 let mut top = Column::optional_strings("top_category", rows);
                 for i in 0..rows {
                     user.push_str_with(|out| key::bytes_into(acc.user[i], out));
                     day.push_i32(acc.day[i]);
-                    sessions.push_i64(acc.sessions[i]);
-                    events.push_i64(acc.events[i]);
-                    revenue.push_i64(acc.revenue[i]);
                     match acc.top[i] {
                         NO_CATEGORY => top.push_null(),
                         c => top.push_str(&categories[c as usize]),
@@ -441,6 +472,7 @@ fn main() {
         String::new()
     };
     log(&format!("written; peak RSS {peak}"));
+    prof::report();
     // Give the memory back on every thread, then leave without the serial teardown.
     if std::env::var("SS_RELEASE").as_deref() != Ok("0") {
         arena::release_all(threads);

@@ -83,6 +83,7 @@ pub fn dedup(
     out: &mut Scatter<PersonEvent>,
     deferred: &mut Scatter<PersonEvent>,
 ) {
+    let t = crate::prof::start();
     let nc = compact.len();
     let slices = nc + full.len();
     let n: usize = compact.iter().map(|p| p.len()).sum::<usize>() + full.iter().map(|p| p.len()).sum::<usize>();
@@ -174,6 +175,7 @@ pub fn dedup(
             insert((((nc + k) as u64) << shift) | o as u64, c.event_id, c.ingest);
         }
     }
+    let t = crate::prof::lap(crate::prof::DEDUP_INSERT, t);
     // The kept copies that survive, in order, then their names.
     kept.clear();
     for (k, part) in compact.iter().enumerate() {
@@ -194,6 +196,7 @@ pub fn dedup(
             }
         }
     }
+    let t = crate::prof::lap(crate::prof::DEDUP_KEPT, t);
     // A user the filter clears is its own person and goes straight to its
     // partition; the others wait in `deferred`, by names-table region, for
     // `resolve_deferred` (their lookups then hit a region in cache, not DRAM).
@@ -211,6 +214,7 @@ pub fn dedup(
             Some(r) => deferred.push_wc(r, e),
         }
     }
+    crate::prof::lap(crate::prof::DEDUP_ROUTE, t);
 }
 
 /// The deferred clicks of one names-table region (one slice per parsing thread):
@@ -337,6 +341,7 @@ impl Acc {
         c.clear();
         persons.clear();
         self.ranks.reset();
+        let t = crate::prof::start();
         for part in evs {
             for x in part {
                 let rank = self.ranks.rank(x.person, &mut persons);
@@ -350,10 +355,12 @@ impl Acc {
                 }
             }
         }
+        let t = crate::prof::lap(crate::prof::SESS_RANK, t);
         let rank_bits = u64::BITS - (persons.len() as u64).leading_zeros();
         // ts sits in the high 32 bits of packed: the key is (rank, ts).
         radix_sort(&mut e, &mut self.evs_tmp, 32 + rank_bits, |x| x.person << 32 | x.packed >> 32);
         radix_sort(&mut c, &mut self.cls_tmp, 32 + rank_bits, |x| x.person << 32 | x.ts as u64);
+        let t = crate::prof::lap(crate::prof::SESS_SORT, t);
         let (mut i, mut ci) = (0usize, 0usize);
         while i < e.len() {
             let rank = e[i].person;
@@ -372,6 +379,7 @@ impl Acc {
             i = j;
             ci = cj;
         }
+        crate::prof::lap(crate::prof::SESS_PERSON, t);
         self.evs = e;
         self.cls = c;
         self.persons = persons;
