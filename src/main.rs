@@ -170,7 +170,7 @@ fn main() {
                     let mut clicks: Scatter<PersonClick> = Scatter::new(person_parts, est_clicks / threads, click_room);
                     let mut buf = Vec::new();
                     let mut pending_events = events::Pending::new();
-                    let mut pending_clicks = events::Pending::new();
+                    let mut pending_clicks = events::ClickPending::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= total_chunks {

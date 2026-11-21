@@ -51,31 +51,41 @@ pub struct EventCopy {
 
 /// A short FIFO of values whose name lookups were prefetched: a value comes out
 /// LAG pushes after it went in, by which time its cache line has arrived.
-pub struct Pending<T: Copy + Default> {
-    buf: [T; LAG],
+pub struct Pending<T: Copy + Default, const N: usize = LAG> {
+    buf: [T; N],
     head: usize,
     len: usize,
 }
 
 const LAG: usize = 16;
 
-impl<T: Copy + Default> Pending<T> {
+impl<T: Copy + Default, const N: usize> Pending<T, N> {
     pub fn new() -> Self {
-        Self { buf: [T::default(); LAG], head: 0, len: 0 }
+        Self { buf: [T::default(); N], head: 0, len: 0 }
     }
 
-    /// Adds `value`; returns the oldest value once LAG are waiting.
+    /// Adds `value`; returns the oldest value once N are waiting.
     #[inline]
     pub fn push(&mut self, value: T) -> Option<T> {
-        if self.len < LAG {
-            self.buf[(self.head + self.len) % LAG] = value;
+        if self.len < N {
+            self.buf[(self.head + self.len) % N] = value;
             self.len += 1;
             None
         } else {
             let out = self.buf[self.head];
             self.buf[self.head] = value;
-            self.head = (self.head + 1) % LAG;
+            self.head = (self.head + 1) % N;
             Some(out)
+        }
+    }
+
+    /// The value pushed `k` pushes before the newest one, if still waiting.
+    #[inline]
+    pub fn back(&self, k: usize) -> Option<&T> {
+        if k < self.len {
+            Some(&self.buf[(self.head + self.len - 1 - k) % N])
+        } else {
+            None
         }
     }
 
@@ -85,11 +95,15 @@ impl<T: Copy + Default> Pending<T> {
             return None;
         }
         let out = self.buf[self.head];
-        self.head = (self.head + 1) % LAG;
+        self.head = (self.head + 1) % N;
         self.len -= 1;
         Some(out)
     }
 }
+
+/// Clicks wait 2 LAG pushes: the filter word is prefetched when a click goes in,
+/// its table slot (only if the filter does not clear it) LAG pushes later.
+pub type ClickPending = Pending<PersonClick, { 2 * LAG }>;
 
 pub struct Context<'a> {
     /// window_start - 7 days: every kept ts is stored relative to it.
@@ -192,7 +206,7 @@ pub fn click_fields(
     f: &[&[u8]; 4],
     cx: &Context,
     names: &Names,
-    pending: &mut Pending<PersonClick>,
+    pending: &mut ClickPending,
     out: &mut Scatter<PersonClick>,
 ) {
     let [click_id, user, campaign, ts] = *f;
@@ -200,7 +214,7 @@ pub fn click_fields(
         return;
     }
     let user_key = key::key(user);
-    names.prefetch(user_key);
+    names.prefetch_filter(user_key);
     let t = match ts::parse(ts) {
         Some(t) if t >= cx.window_start.saturating_sub(WEEK) && t < cx.window_end => t,
         _ => return,
@@ -218,10 +232,13 @@ pub fn click_fields(
         old.person = names.get(old.person);
         out.push(bucket(mix(old.person), out.parts()), old);
     }
+    if let Some(mid) = pending.back(LAG) {
+        names.prefetch_if_renamed(mid.person);
+    }
 }
 
 /// Resolves and stores the clicks still waiting in `pending`.
-pub fn flush_clicks(names: &Names, pending: &mut Pending<PersonClick>, out: &mut Scatter<PersonClick>) {
+pub fn flush_clicks(names: &Names, pending: &mut ClickPending, out: &mut Scatter<PersonClick>) {
     while let Some(mut old) = pending.pop() {
         old.person = names.get(old.person);
         out.push(bucket(mix(old.person), out.parts()), old);
