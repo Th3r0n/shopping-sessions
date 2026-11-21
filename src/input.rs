@@ -248,31 +248,35 @@ unsafe fn simd_range<const N: usize, F: FnMut(&[&[u8]; N])>(
         let below = (1u128 << l) - 1;
         let commas = c & below;
         if l != 0 && commas.count_ones() as usize == N - 1 {
-            let quotes = q & below;
-            let mut ok = true;
+            // A field is quoted when it is at least 2 bytes long and starts and ends
+            // with a quote. The line is well formed exactly when its quotes are
+            // those of its quoted fields: two per quoted field, none elsewhere.
+            let quotes = (q & below).count_ones();
+            let line = buf.get_unchecked(p..p + l);
+            let (mut lo, mut hi) = (commas as u64, (commas >> 64) as u64);
             let mut s = 0usize;
-            let mut rest = commas;
+            let mut quoted = 0u32;
             for (k, slot) in out.iter_mut().enumerate() {
-                let e = if k + 1 < N {
-                    let e = rest.trailing_zeros() as usize;
-                    rest &= rest - 1;
+                let e = if k + 1 == N {
+                    l
+                } else if lo != 0 {
+                    let e = lo.trailing_zeros() as usize;
+                    lo &= lo - 1;
                     e
                 } else {
-                    l
+                    let e = 64 + hi.trailing_zeros() as usize;
+                    hi &= hi - 1;
+                    e
                 };
-                let width = e - s;
-                let in_field = if width == 0 { 0 } else { (quotes >> s) & ((1u128 << width) - 1) };
-                if in_field == 0 {
-                    *slot = buf.get_unchecked(p + s..p + e);
-                } else if width >= 2 && in_field == (1 | (1u128 << (width - 1))) {
+                if quotes != 0 && e >= s + 2 && *line.get_unchecked(s) == b'"' && *line.get_unchecked(e - 1) == b'"' {
+                    quoted += 1;
                     *slot = buf.get_unchecked(p + s + 1..p + e - 1);
                 } else {
-                    ok = false;
-                    break;
+                    *slot = buf.get_unchecked(p + s..p + e);
                 }
                 s = e + 1;
             }
-            if ok {
+            if quotes == 2 * quoted {
                 f(&out);
             }
         }
