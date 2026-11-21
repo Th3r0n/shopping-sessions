@@ -340,11 +340,7 @@ fn main() {
 
         let mut stats = vec![[0i64; 4]; (shape.campaigns + 1) * shape.days];
         for acc in &accs {
-            for (total, part) in stats.iter_mut().zip(&acc.stats) {
-                for k in 0..4 {
-                    total[k] += part[k];
-                }
-            }
+            acc.add_stats(&mut stats);
         }
         let rows = stats.iter().filter(|st| st[0] != 0 || st[3] != 0).count();
         let mut ids = Column::strings("campaign_id", rows);
