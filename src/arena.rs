@@ -304,9 +304,185 @@ impl<T: Copy> Scatter<T> {
     }
 }
 
+/// Words of a BLOCK_BYTES unit; a Words3 block uses the first WORDS3_BLOCK.
+const UNIT_WORDS: usize = BLOCK_BYTES / 8;
+/// 168 records of 3 words, 63 whole lines: no record and no line crosses a block.
+const WORDS3_BLOCK: usize = 504;
+
+/// Records of three words scattered into partitions, write-combined like
+/// `Scatter::push_wc` but word by word, so a record may span two staging lines
+/// (never two blocks). Blocks start BLOCK_BYTES apart, so a `Scatter` can adopt
+/// them. When the arena is used up, another one is mapped.
+pub struct Words3 {
+    regions: Vec<Region<u64>>,
+    /// Words per region.
+    capacity: usize,
+    /// Words carved from the last region.
+    used: usize,
+    blocks: Vec<Vec<*mut u64>>,
+    current: Vec<*mut u64>,
+    /// Words written to the current block.
+    fill: Vec<u32>,
+    staging: Vec<Line>,
+    /// Words waiting in the staging line.
+    staged: Vec<u8>,
+}
+
+// SAFETY: a Words3 owns its memory exclusively.
+unsafe impl Send for Words3 {}
+unsafe impl Sync for Words3 {}
+
+impl Words3 {
+    /// `parts` partitions, room for about `records` records before mapping more.
+    pub fn new(parts: usize, records: usize) -> Self {
+        let capacity = (records * 3).div_ceil(WORDS3_BLOCK) * UNIT_WORDS + parts * UNIT_WORDS;
+        Self {
+            regions: vec![Region::new(capacity)],
+            capacity,
+            used: 0,
+            blocks: (0..parts).map(|_| Vec::new()).collect(),
+            current: vec![std::ptr::null_mut(); parts],
+            fill: vec![WORDS3_BLOCK as u32; parts],
+            staging: vec![Line([0; 64]); parts],
+            staged: vec![0; parts],
+        }
+    }
+
+    pub fn parts(&self) -> usize {
+        self.blocks.len()
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, p: usize, record: [u64; 3]) {
+        let mut n = self.staged[p] as usize;
+        let line = self.staging[p].0.as_mut_ptr() as *mut u64;
+        for word in record {
+            // SAFETY: n < 8: inside the 64-byte staging line.
+            unsafe { line.add(n).write(word) };
+            n += 1;
+            if n == 8 {
+                self.flush_line(p);
+                n = 0;
+            }
+        }
+        self.staged[p] = n as u8;
+    }
+
+    #[inline(always)]
+    fn flush_line(&mut self, p: usize) {
+        if self.fill[p] as usize == WORDS3_BLOCK {
+            self.new_block(p);
+        }
+        // SAFETY: fill + 8 <= WORDS3_BLOCK words, inside the block; 64-byte aligned.
+        unsafe {
+            let dst = self.current[p].add(self.fill[p] as usize) as *mut u8;
+            stream_line(dst, self.staging[p].0.as_ptr());
+        }
+        self.fill[p] += 8;
+    }
+
+    #[inline(never)]
+    fn new_block(&mut self, p: usize) {
+        if self.used + UNIT_WORDS > self.capacity {
+            self.regions.push(Region::new(self.capacity));
+            self.used = 0;
+        }
+        // SAFETY: used + UNIT_WORDS <= capacity, inside the last region.
+        let b = unsafe { self.regions.last().unwrap().ptr.add(self.used) };
+        self.used += UNIT_WORDS;
+        self.blocks[p].push(b);
+        self.current[p] = b;
+        self.fill[p] = 0;
+    }
+
+    /// Writes out the staged words (which end whole records); call before reading.
+    pub fn finish(&mut self) {
+        for p in 0..self.staged.len() {
+            let n = self.staged[p] as usize;
+            if n == 0 {
+                continue;
+            }
+            if self.fill[p] as usize == WORDS3_BLOCK {
+                self.new_block(p);
+            }
+            // SAFETY: fill is a multiple of 8 below 504 and n < 8: inside the block.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.staging[p].0.as_ptr() as *const u64,
+                    self.current[p].add(self.fill[p] as usize),
+                    n,
+                )
+            };
+            self.fill[p] += n as u32;
+            self.staged[p] = 0;
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a store fence orders the non-temporal stores before later ones.
+        unsafe {
+            std::arch::x86_64::_mm_sfence()
+        };
+    }
+
+    /// The records of partition p (after `finish`), as slices.
+    #[inline]
+    pub fn part(&self, p: usize) -> impl Iterator<Item = &[[u64; 3]]> + '_ {
+        let blocks = &self.blocks[p];
+        let last = blocks.len().wrapping_sub(1);
+        blocks.iter().enumerate().map(move |(i, &b)| {
+            let words = if i == last { self.fill[p] as usize } else { WORDS3_BLOCK };
+            // SAFETY: the block's first `words` words were written, whole records.
+            unsafe { std::slice::from_raw_parts(b as *const [u64; 3], words / 3) }
+        })
+    }
+
+    /// The blocks of partition p, BLOCK_BYTES apart, for `Scatter::adopt`.
+    pub fn blocks_of(&self, p: usize) -> &[*mut u64] {
+        &self.blocks[p]
+    }
+
+    /// Records in partition p (after `finish`).
+    pub fn len(&self, p: usize) -> usize {
+        self.part(p).map(<[[u64; 3]]>::len).sum()
+    }
+
+    pub fn total(&self) -> usize {
+        (0..self.parts()).map(|p| self.len(p)).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Scatter;
+    use super::{Scatter, Words3};
+
+    #[test]
+    fn words3_keep_order_across_lines_blocks_and_regions() {
+        for records in [0usize, 10, 1000] {
+            let mut s = Words3::new(5, records);
+            for i in 0..20_003u64 {
+                s.push((i * 7 % 5) as usize, [i, !i, i * 3]);
+            }
+            s.finish();
+            let mut total = 0;
+            for p in 0..5 {
+                let all: Vec<[u64; 3]> = s.part(p).flatten().copied().collect();
+                let want: Vec<[u64; 3]> = (0..20_003).filter(|i| i * 7 % 5 == p as u64).map(|i| [i, !i, i * 3]).collect();
+                assert_eq!(all, want);
+                total += all.len();
+            }
+            assert_eq!(total, 20_003);
+            assert_eq!(s.total(), 20_003);
+            // its blocks can be adopted by a Scatter of 16-byte values
+            let mut b: Scatter<[u64; 2]> = Scatter::new(2, 100, 0);
+            for p in 0..5 {
+                b.adopt(s.blocks_of(p));
+            }
+            for i in 0..30_000u64 {
+                b.push_wc((i % 2) as usize, [i, i]);
+            }
+            b.finish();
+            assert_eq!(b.total(), 30_000);
+        }
+    }
 
     #[test]
     fn write_combining_matches() {

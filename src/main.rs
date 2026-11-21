@@ -24,7 +24,7 @@ mod ts;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arena::Scatter;
+use arena::{Scatter, Words3};
 
 use events::{Context, EventCopy};
 use output::Column;
@@ -105,7 +105,7 @@ fn main() {
     // generic binary, which has none of these limits.
     let base = window.start - events::WEEK;
     let compact_ok = window.end > window.start
-        && window.end - base <= u32::MAX as i64
+        && window.end - base <= events::C_TS as i64
         && products.categories.len() <= events::MAX_CATEGORIES;
     if !compact_ok || std::env::var_os("SS_FORCE_GENERIC").is_some() {
         run_generic(&args);
@@ -153,8 +153,8 @@ fn main() {
     let click_room = est_clicks * 13 / 10 / busy;
     let next = AtomicUsize::new(0);
     let names_cell: std::sync::OnceLock<links::Names> = std::sync::OnceLock::new();
-    let mut event_parts: Vec<Scatter<EventCopy>> = Vec::with_capacity(threads);
-    let mut person_clicks: Vec<Scatter<PersonClick>> = Vec::with_capacity(threads);
+    let mut event_parts: Vec<events::Copies> = Vec::with_capacity(threads);
+    let mut person_clicks: Vec<Words3> = Vec::with_capacity(threads);
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -166,10 +166,12 @@ fn main() {
                         let _ = names_cell.set(links::build(link_pairs));
                         eprintln!("           names built in {:.3}s on thread 0", started.elapsed().as_secs_f64());
                     }
-                    let mut parts: Scatter<EventCopy> = Scatter::new(eid_parts, est_copies / threads, event_room);
-                    let mut clicks: Scatter<PersonClick> = Scatter::new(person_parts, est_clicks / threads, click_room);
+                    let mut parts = events::Copies {
+                        compact: Words3::new(eid_parts, event_room),
+                        full: Scatter::new(eid_parts, est_copies / threads / 16, event_room / 8),
+                    };
+                    let mut clicks = Words3::new(person_parts, click_room);
                     let mut buf = Vec::new();
-                    let mut pending_events = events::Pending::new();
                     let mut pending_clicks = events::ClickPending::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -177,10 +179,8 @@ fn main() {
                             break;
                         }
                         if i < event_chunks.len() {
-                            // Names, once built, are resolved right away.
-                            let names = if std::env::var_os("SS_RESOLVE_AT_PARSE").is_some() { names_cell.get() } else { None };
                             event_input.parse::<7, _>(&event_chunks[i], &mut buf, simd, &mut |f| {
-                                events::event_fields(f, cx, names, &mut pending_events, &mut parts)
+                                events::event_fields(f, cx, &mut parts)
                             });
                         } else {
                             // Clicks come last; they go straight to their person's partition.
@@ -191,10 +191,11 @@ fn main() {
                         }
                     }
                     if let Some(names) = names_cell.get() {
-                        events::flush_events(names, &mut pending_events, &mut parts);
                         events::flush_clicks(names, &mut pending_clicks, &mut clicks);
                     }
-                    parts.finish();
+                    parts.compact.finish();
+                    parts.full.finish();
+                    clicks.finish();
                     (parts, clicks)
                 })
             })
@@ -214,8 +215,8 @@ fn main() {
     }
     log(&format!(
         "events parsed: {} copies, {} valid clicks",
-        event_parts.iter().map(Scatter::total).sum::<usize>(),
-        person_clicks.iter().map(Scatter::total).sum::<usize>()
+        event_parts.iter().map(|t| t.compact.total() + t.full.total()).sum::<usize>(),
+        person_clicks.iter().map(Words3::total).sum::<usize>()
     ));
 
     // Phase 2: dedup and route to person partitions.
@@ -231,21 +232,24 @@ fn main() {
                         let mut evs: Scatter<PersonEvent> = Scatter::new(person_parts, est_copies / threads, person_room);
                         let mut table = sessions::Table::default();
                         let mut kept = Vec::new();
-                        let mut slices: Vec<&[EventCopy]> = Vec::with_capacity(2 * event_parts.len());
+                        let mut compact: Vec<&[[u64; 3]]> = Vec::with_capacity(8 * event_parts.len());
+                        let mut full: Vec<&[EventCopy]> = Vec::with_capacity(2 * event_parts.len());
                         loop {
                             let p = next.fetch_add(1, Ordering::Relaxed);
                             if p >= eid_parts {
                                 break;
                             }
-                            slices.clear();
-                            slices.extend(event_parts.iter().flat_map(|t| t.part(p)));
-                            sessions::dedup(&slices, names, &mut table, &mut kept, &mut evs);
-                            slices.clear();
+                            compact.extend(event_parts.iter().flat_map(|t| t.compact.part(p)));
+                            full.extend(event_parts.iter().flat_map(|t| t.full.part(p)));
+                            sessions::dedup(&compact, &full, base, names, &mut table, &mut kept, &mut evs);
+                            compact.clear();
+                            full.clear();
                             // Partition p is done: its blocks become this thread's
                             // (already touched) memory for person events.
                             if recycle {
                                 for t in event_parts.iter() {
-                                    evs.adopt(t.blocks_of(p));
+                                    evs.adopt(t.compact.blocks_of(p));
+                                    evs.adopt(t.full.blocks_of(p));
                                 }
                             }
                         }
@@ -288,7 +292,7 @@ fn main() {
                         let Some(&(_, q)) = order.get(i) else { break };
                         acc.partition(
                             person_events.iter().flat_map(|t| t.part(q)),
-                            person_clicks.iter().flat_map(|t| t.part(q)),
+                            person_clicks.iter().flat_map(|t| t.part(q)).map(PersonClick::of_words),
                         );
                     }
                     acc

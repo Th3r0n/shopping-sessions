@@ -1,6 +1,6 @@
 //! Event and click lines to records.
 
-use crate::arena::Scatter;
+use crate::arena::{Scatter, Words3};
 use crate::hash::{bucket, mix};
 use crate::key;
 use crate::links::Names;
@@ -14,9 +14,24 @@ use crate::ts::{self, DAY};
 /// and every category id in 5; otherwise the generic binary runs instead.
 pub const SURVIVES: u64 = 1 << 29;
 pub const PURCHASE: u64 = 1 << 30;
-/// `user` already holds the person's name.
-pub const RESOLVED: u64 = 1 << 31;
 pub const MAX_CATEGORIES: usize = 32;
+
+/// The copies of a thread, in two scatters over the same event_id partitions:
+/// most in 3 words (`compact`), the rest as an EventCopy (`full`).
+///
+/// A compact copy is [event_id, user, ingest_s << 32 | C_SURVIVES | ts_rel]:
+/// ingest_ts in whole seconds after `Context::base` (as an i32), ts relative to
+/// base in 31 bits (main checks the window allows it). It holds a copy that would
+/// not survive (user and ts 0), or one that would and is not a purchase. Copies
+/// whose ingest_ts does not fit, and surviving purchases (price and category),
+/// are full.
+pub struct Copies {
+    pub compact: Words3,
+    pub full: Scatter<EventCopy>,
+}
+
+pub const C_SURVIVES: u64 = 1 << 31;
+pub const C_TS: u64 = (1 << 31) - 1;
 
 #[inline]
 pub fn pack(ts_rel: u32, price: u32, category: u16, flags: u64) -> u64 {
@@ -130,13 +145,7 @@ fn price(b: &[u8]) -> Option<u32> {
 }
 
 #[inline]
-pub fn event_fields(
-    f: &[&[u8]; 7],
-    cx: &Context,
-    names: Option<&Names>,
-    pending: &mut Pending<EventCopy>,
-    parts: &mut Scatter<EventCopy>,
-) {
+pub fn event_fields(f: &[&[u8]; 7], cx: &Context, parts: &mut Copies) {
     let [event_id, user, ts, ingest, event_type, product, price_cents] = *f;
     if event_id.is_empty() {
         return;
@@ -156,11 +165,7 @@ pub fn event_fields(
             b"purchase" => true,
             _ => break 'valid,
         };
-        // The name lookup misses the cache: start loading it before the rest.
         let user_key = key::key(user);
-        if let Some(names) = names {
-            names.prefetch(user_key);
-        }
         let t = match ts::parse(ts) {
             Some(t) if t >= cx.window_start && t < cx.window_end => t,
             _ => break 'valid,
@@ -179,27 +184,20 @@ pub fn event_fields(
         let flags = SURVIVES | if purchase { PURCHASE } else { 0 };
         copy.packed = pack((t - cx.base) as u32, cents, category, flags);
         copy.user = user_key;
-        if let Some(names) = names {
-            // Resolved LAG lines later, once the prefetched slot has arrived.
-            copy.packed |= RESOLVED;
-            if let Some(mut old) = pending.push(copy) {
-                old.user = names.get(old.user);
-                parts.push_wc(bucket(mix(old.event_id), parts.parts()), old);
-            }
-            return;
-        }
     }
-    let p = bucket(mix(copy.event_id), parts.parts());
-    parts.push_wc(p, copy);
+    let p = bucket(mix(copy.event_id), parts.full.parts());
+    let rel = copy.ingest.wrapping_sub(cx.base);
+    let seconds = rel / 1000;
+    if rel % 1000 == 0 && seconds == seconds as i32 as i64 && copy.packed & PURCHASE == 0 {
+        let survives = copy.packed & SURVIVES != 0;
+        let word = (seconds as i32 as u32 as u64) << 32
+            | if survives { C_SURVIVES | ts_of(copy.packed) as u64 } else { 0 };
+        parts.compact.push(p, [copy.event_id, copy.user, word]);
+    } else {
+        parts.full.push_wc(p, copy);
+    }
 }
 
-/// Resolves and stores what is still waiting in `pending`.
-pub fn flush_events(names: &Names, pending: &mut Pending<EventCopy>, parts: &mut Scatter<EventCopy>) {
-    while let Some(mut old) = pending.pop() {
-        old.user = names.get(old.user);
-        parts.push_wc(bucket(mix(old.event_id), parts.parts()), old);
-    }
-}
 
 #[inline]
 pub fn click_fields(
@@ -207,7 +205,7 @@ pub fn click_fields(
     cx: &Context,
     names: &Names,
     pending: &mut ClickPending,
-    out: &mut Scatter<PersonClick>,
+    out: &mut Words3,
 ) {
     let [click_id, user, campaign, ts] = *f;
     if click_id.is_empty() || user.is_empty() {
@@ -230,7 +228,7 @@ pub fn click_fields(
     };
     if let Some(mut old) = pending.push(click) {
         old.person = names.get(old.person);
-        out.push(bucket(mix(old.person), out.parts()), old);
+        out.push(bucket(mix(old.person), out.parts()), old.words());
     }
     if let Some(mid) = pending.back(LAG) {
         names.prefetch_if_renamed(mid.person);
@@ -238,10 +236,10 @@ pub fn click_fields(
 }
 
 /// Resolves and stores the clicks still waiting in `pending`.
-pub fn flush_clicks(names: &Names, pending: &mut ClickPending, out: &mut Scatter<PersonClick>) {
+pub fn flush_clicks(names: &Names, pending: &mut ClickPending, out: &mut Words3) {
     while let Some(mut old) = pending.pop() {
         old.person = names.get(old.person);
-        out.push(bucket(mix(old.person), out.parts()), old);
+        out.push(bucket(mix(old.person), out.parts()), old.words());
     }
 }
 

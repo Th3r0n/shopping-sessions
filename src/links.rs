@@ -79,16 +79,6 @@ impl Names {
         }
     }
 
-    /// Starts loading the slot `get(user)` will read first (and the filter word).
-    #[inline]
-    pub fn prefetch(&self, user: u64) {
-        let h = mix(user);
-        prefetch(self.slots.as_ptr().wrapping_add(crate::hash::bucket(h, self.size)));
-        if self.shift != 0 {
-            prefetch(self.filter.as_ptr().wrapping_add(self.filter_bit(h).0));
-        }
-    }
-
     /// First of two prefetch steps: the filter word.
     #[inline]
     pub fn prefetch_filter(&self, user: u64) {
