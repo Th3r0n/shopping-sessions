@@ -153,14 +153,16 @@ pub struct Acc {
 }
 
 impl Acc {
-    pub fn new(shape: Shape) -> Self {
+    /// `rows`: about how many user_daily rows this thread will produce.
+    pub fn new(shape: Shape, rows: usize) -> Self {
+        use crate::arena::huge_vec;
         Self {
-            user: Vec::new(),
-            day: Vec::new(),
-            sessions: Vec::new(),
-            events: Vec::new(),
-            revenue: Vec::new(),
-            top: Vec::new(),
+            user: huge_vec(rows),
+            day: huge_vec(rows),
+            sessions: huge_vec(rows),
+            events: huge_vec(rows),
+            revenue: huge_vec(rows),
+            top: huge_vec(rows),
             stats: vec![[0; 4]; (shape.campaigns + 1) * shape.days],
             shape,
             count: vec![0; shape.campaigns],

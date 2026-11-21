@@ -67,6 +67,25 @@ pub fn zeroed_slice<T: Copy>(n: usize) -> &'static mut [T] {
     unsafe { std::slice::from_raw_parts_mut(ptr, n) }
 }
 
+/// A Vec of `n` values whose buffer is advised to use transparent huge pages,
+/// so filling it costs a few faults instead of one per 4 KiB.
+pub fn huge_vec<T>(n: usize) -> Vec<T> {
+    let v: Vec<T> = Vec::with_capacity(n);
+    #[cfg(target_os = "linux")]
+    {
+        const HUGE_PAGE: usize = 2 << 20;
+        let start = (v.as_ptr() as usize).div_ceil(HUGE_PAGE) * HUGE_PAGE;
+        let end = (v.as_ptr() as usize + n * std::mem::size_of::<T>()) / HUGE_PAGE * HUGE_PAGE;
+        if end > start {
+            // SAFETY: advice on memory this Vec owns.
+            unsafe {
+                libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
+            }
+        }
+    }
+    v
+}
+
 /// Values scattered into partitions, stored in blocks carved in order from one
 /// per-thread arena: the memory touched (and zeroed by the kernel) is the data
 /// actually written, not a reserved capacity per partition.

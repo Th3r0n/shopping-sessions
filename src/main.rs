@@ -281,7 +281,8 @@ fn main() {
             .map(|_| {
                 let (order, person_events, person_clicks, next) = (&order, &person_events, &person_clicks, &next);
                 s.spawn(move || {
-                    let mut acc = Acc::new(shape);
+                    // about 1 user_daily row per 9.5 event copies in the generator's data
+                    let mut acc = Acc::new(shape, est_copies / 8 / threads + 1024);
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&(_, q)) = order.get(i) else { break };
