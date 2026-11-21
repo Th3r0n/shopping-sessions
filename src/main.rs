@@ -86,8 +86,14 @@ fn main() {
     let click_bytes = click_input.bytes() as usize;
     let simd = input::use_simd();
     let est_copies = event_bytes / 75 + 1;
-    let eid_parts = env_usize("SS_PARTS").unwrap_or((est_copies / 16_384).clamp(1, 4096)).max(1);
-    let person_parts = env_usize("SS_PARTS").unwrap_or((est_copies / 32_768).clamp(1, 4096)).max(1);
+    let eid_parts = env_usize("SS_EID_PARTS")
+        .or_else(|| env_usize("SS_PARTS"))
+        .unwrap_or((est_copies / 16_384).clamp(1, 4096))
+        .max(1);
+    let person_parts = env_usize("SS_PERSON_PARTS")
+        .or_else(|| env_usize("SS_PARTS"))
+        .unwrap_or((est_copies / 32_768).clamp(1, 4096))
+        .max(1);
     log(&format!(
         "threads {threads}, simd {simd}, events {event_bytes} B in {} files, clicks {click_bytes} B, {} link files, partitions {eid_parts}/{person_parts}",
         event_input.files.len(),

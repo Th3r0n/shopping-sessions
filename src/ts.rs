@@ -183,6 +183,13 @@ pub fn parse(b: &[u8]) -> Option<i64> {
             }
             civil_ms(b[..19].try_into().unwrap()).map(|local| local - sign * (hours * 60 + minutes) * 60_000)
         }
+        13 => {
+            // The usual F3 (13 digits): two overlapping 8-byte words.
+            let hi = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let lo = u64::from_le_bytes(b[5..13].try_into().unwrap());
+            let (hi, lo) = (digits8(hi)?, digits8(lo)?);
+            Some((hi * 100_000 + lo % 100_000) as i64)
+        }
         1..=18 => {
             // F3 that cannot overflow: one pass checks and converts.
             let mut value: i64 = 0;
@@ -197,6 +204,21 @@ pub fn parse(b: &[u8]) -> Option<i64> {
         }
         _ => parse_epoch(b),
     }
+}
+
+/// The 8 ASCII digits of a little-endian word (first digit in the low byte) as a
+/// number, or None if any byte is not 0-9.
+#[inline(always)]
+fn digits8(word: u64) -> Option<u64> {
+    let v = word.wrapping_sub(0x3030_3030_3030_3030);
+    // a byte is a digit iff v <= 9 there: no borrow into the high bit, and adding
+    // 0x76 does not carry into it either
+    if (v | v.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let v = (v.wrapping_mul(10) + (v >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let v = (v.wrapping_mul(100) + (v >> 16)) & 0x0000_ffff_0000_ffff;
+    Some((v.wrapping_mul(10_000) + (v >> 32)) & 0xffff_ffff)
 }
 
 #[inline]
@@ -245,6 +267,26 @@ mod tests {
         assert_eq!(f1("1970-01-01T00:00:00Z"), 0);
         assert_eq!(f1("9223372036854775807"), i64::MAX);
         assert_eq!(f1("2027-01-01T05:00:00+12:00"), f1("2026-12-31T17:00:00Z"));
+    }
+
+    #[test]
+    fn digits8_words() {
+        assert_eq!(digits8(u64::from_le_bytes(*b"12345678")), Some(12_345_678));
+        assert_eq!(digits8(u64::from_le_bytes(*b"00000000")), Some(0));
+        assert_eq!(digits8(u64::from_le_bytes(*b"99999999")), Some(99_999_999));
+        assert_eq!(digits8(u64::from_le_bytes([b'1', b'2', b'3', b'4', b'5', b'6', 0xff, b'8'])), None);
+        for bad in [*b"1234567:", *b"/2345678", *b"1234 678"] {
+            assert_eq!(digits8(u64::from_le_bytes(bad)), None, "{:?}", bad);
+        }
+        // every single-byte corruption of a valid word
+        for pos in 0..8 {
+            for byte in 0..=255u8 {
+                let mut w = *b"31415926";
+                w[pos] = byte;
+                let expect = w.iter().all(u8::is_ascii_digit).then(|| std::str::from_utf8(&w).unwrap().parse::<u64>().unwrap());
+                assert_eq!(digits8(u64::from_le_bytes(w)), expect, "{:?}", w);
+            }
+        }
     }
 
     #[test]
