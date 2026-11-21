@@ -42,21 +42,26 @@ fn small_rows<const N: usize>(path: &Path, mut f: impl FnMut([&[u8]; N])) {
     });
 }
 
-/// An exact map from ID bytes to a small index: packable IDs in a small
-/// open-addressing table of (key, value + 1) slots, the rest in a HashMap.
+/// An exact map from ID bytes to a small index.
+///
+/// While every ID is `prefix` + a canonical decimal number (like `c_123`), the
+/// values sit in a table indexed by that number: a lookup parses the number, and
+/// any other string cannot be one of the IDs. At the first ID of another shape
+/// (or one too sparse for a table), the IDs so far are rebuilt from the table into
+/// the hashed form: packable IDs in an open-addressing table of (key, value + 1)
+/// slots, the rest in a HashMap.
 pub struct IdMap {
     slots: Vec<[u64; 2]>,
     mask: usize,
     len: usize,
     other: std::collections::HashMap<Vec<u8>, u32>,
-    /// While inserting: the common `prefix` + number shape, if every ID so far has
-    /// it, and the (number, value) pairs in insertion order.
-    shape: Option<(Vec<u8>, Vec<(usize, u32)>)>,
-    started: bool,
-    /// When every ID is `prefix` + a canonical decimal number (like `c_123`), the
-    /// values indexed by that number (value + 1; 0 = absent): any other string
-    /// cannot be one of the IDs.
+    /// The direct form: prefix, then values by number (value + 1; 0 = absent).
     direct: Option<(Vec<u8>, Vec<u32>)>,
+    /// IDs in the direct table.
+    count: usize,
+    hashed: bool,
+    /// About how many IDs the hashed form should have room for.
+    hint: usize,
 }
 
 impl IdMap {
@@ -64,52 +69,72 @@ impl IdMap {
         Self::with_capacity(8)
     }
 
-    /// Room for about `n` IDs without growing.
+    /// Room for about `n` IDs without growing, if the hashed form is needed.
     fn with_capacity(n: usize) -> Self {
-        let size = (n.max(8) * 2).next_power_of_two();
         Self {
-            slots: vec![[0, 0]; size],
-            mask: size - 1,
+            slots: vec![[0, 0]; 16],
+            mask: 15,
             len: 0,
             other: std::collections::HashMap::new(),
-            shape: None,
-            started: false,
             direct: None,
+            count: 0,
+            hashed: false,
+            hint: n,
         }
     }
 
-    /// Records `id` for the direct index while it keeps the `prefix` + number shape.
-    fn note_shape(&mut self, id: &[u8], value: u32) {
-        if !self.started {
-            self.started = true;
-            let prefix: Vec<u8> = id.iter().take_while(|b| !b.is_ascii_digit()).copied().collect();
-            if !prefix.is_empty() {
-                self.shape = Some((prefix, Vec::new()));
+    fn insert(&mut self, id: &[u8], value: u32) {
+        if !self.hashed {
+            if self.direct.is_none() {
+                let prefix: Vec<u8> = id.iter().take_while(|b| !b.is_ascii_digit()).copied().collect();
+                if prefix.is_empty() {
+                    self.to_hashed();
+                } else {
+                    self.direct = Some((prefix, Vec::new()));
+                }
+            }
+            if let Some((prefix, table)) = &mut self.direct {
+                if let Some(n) = id.strip_prefix(prefix.as_slice()).and_then(canonical) {
+                    if n < table.len() || n <= 4 * (self.count + 1) + 1024 {
+                        if n >= table.len() {
+                            table.resize(n + 1, 0);
+                        }
+                        self.count += (table[n] == 0) as usize;
+                        table[n] = value + 1; // a later value wins, as in the hashed form
+                        return;
+                    }
+                }
+                self.to_hashed();
             }
         }
-        if let Some((prefix, pairs)) = &mut self.shape {
-            if pairs.capacity() == 0 {
-                pairs.reserve(self.slots.len() / 2);
-            }
-            match id.strip_prefix(prefix.as_slice()).and_then(canonical) {
-                Some(n) => pairs.push((n, value)),
-                None => self.shape = None,
+        self.insert_hashed(id, value);
+    }
+
+    /// Leaves the direct form: its IDs are rebuilt as prefix + number.
+    fn to_hashed(&mut self) {
+        self.hashed = true;
+        let size = (self.hint.max(self.count).max(8) * 2).next_power_of_two();
+        self.slots = vec![[0, 0]; size];
+        self.mask = size - 1;
+        self.len = 0;
+        if let Some((prefix, table)) = self.direct.take() {
+            for (n, &v) in table.iter().enumerate() {
+                if v != 0 {
+                    let mut id = prefix.clone();
+                    id.extend_from_slice(n.to_string().as_bytes());
+                    self.insert_hashed(&id, v - 1);
+                }
             }
         }
     }
 
-    /// Builds the direct index when every ID had the `prefix` + number shape.
-    fn seal(&mut self) {
-        let Some((prefix, pairs)) = self.shape.take() else { return };
-        let max = pairs.iter().map(|&(n, _)| n).max().unwrap_or(0);
-        if pairs.is_empty() || max > 4 * pairs.len() + 1024 {
-            return; // nothing to index, or too sparse for a table
+    fn insert_hashed(&mut self, id: &[u8], value: u32) {
+        match key::pack(id) {
+            Some(k) => self.insert_packed(k, value),
+            None => {
+                self.other.insert(id.to_vec(), value);
+            }
         }
-        let mut table = vec![0u32; max + 1];
-        for (n, value) in pairs {
-            table[n] = value + 1; // later inserts overwrite, as in the hashed map
-        }
-        self.direct = Some((prefix, table));
     }
 
     fn insert_packed(&mut self, k: u64, value: u32) {
@@ -139,16 +164,6 @@ impl IdMap {
         }
     }
 
-    fn insert(&mut self, id: &[u8], value: u32) {
-        self.note_shape(id, value);
-        match key::pack(id) {
-            Some(k) => self.insert_packed(k, value),
-            None => {
-                self.other.insert(id.to_vec(), value);
-            }
-        }
-    }
-
     #[inline]
     pub fn get(&self, id: &[u8]) -> Option<u32> {
         if let Some((prefix, table)) = &self.direct {
@@ -158,28 +173,9 @@ impl IdMap {
                 _ => None,
             };
         }
-        self.get_hashed(id)
-    }
-
-    /// Replaces every stored value v by `to[v]` (before `seal`).
-    fn remap(&mut self, to: &[u32]) {
-        for slot in self.slots.iter_mut() {
-            if slot[0] != 0 {
-                slot[1] = to[(slot[1] - 1) as usize] as u64 + 1;
-            }
+        if !self.hashed {
+            return None; // empty
         }
-        for v in self.other.values_mut() {
-            *v = to[*v as usize];
-        }
-        if let Some((_, pairs)) = &mut self.shape {
-            for (_, v) in pairs.iter_mut() {
-                *v = to[*v as usize];
-            }
-        }
-    }
-
-    #[inline]
-    fn get_hashed(&self, id: &[u8]) -> Option<u32> {
         match key::pack(id) {
             Some(k) => {
                 let mut i = mix(k) as usize & self.mask;
@@ -195,6 +191,23 @@ impl IdMap {
                 }
             }
             None => self.other.get(id).copied(),
+        }
+    }
+
+    /// Replaces every stored value v by `to[v]`.
+    fn remap(&mut self, to: &[u32]) {
+        if let Some((_, table)) = &mut self.direct {
+            for v in table.iter_mut().filter(|v| **v != 0) {
+                *v = to[(*v - 1) as usize] + 1;
+            }
+        }
+        for slot in self.slots.iter_mut() {
+            if slot[0] != 0 {
+                slot[1] = to[(slot[1] - 1) as usize] as u64 + 1;
+            }
+        }
+        for v in self.other.values_mut() {
+            *v = to[*v as usize];
         }
     }
 }
@@ -231,7 +244,7 @@ impl Products {
         let mut index: std::collections::HashMap<Vec<u8>, u32> = std::collections::HashMap::new();
         let path = dir.join("products.csv");
         let bytes = std::fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0);
-        let mut map = IdMap::with_capacity(bytes / 10);
+        let mut map = IdMap::with_capacity(bytes / 14);
         small_rows::<2>(&path, |[product, category]| {
             if !product.is_empty() && !category.is_empty() {
                 let provisional = match names.iter().position(|n| n.as_slice() == category) {
@@ -262,7 +275,6 @@ impl Products {
             renumber[*provisional as usize] = id_of(name);
         }
         map.remap(&renumber);
-        map.seal();
         let unknown = id_of(b"unknown") as u16;
         Self { map, categories, unknown }
     }
@@ -294,7 +306,6 @@ impl Campaigns {
                 channels.push(channel.to_vec());
             }
         });
-        map.seal();
         Self { map, ids, channels }
     }
 
@@ -314,7 +325,6 @@ mod tests {
         for i in 1..=2000u32 {
             m.insert(format!("c_{i}").as_bytes(), i - 1);
         }
-        m.seal();
         assert!(m.direct.is_some());
         for (id, want) in [("c_1", Some(0)), ("c_2000", Some(1999)), ("c_2001", None), ("c_0", None), ("c_012", None),
                            ("C_12", None), ("c_", None), ("c_1 ", None), ("c_12x", None), ("x_12", None), ("", None),
@@ -325,7 +335,6 @@ mod tests {
         let mut m = IdMap::new();
         m.insert(b"c_1", 0);
         m.insert(b"c_01", 1);
-        m.seal();
         assert!(m.direct.is_none());
         assert_eq!(m.get(b"c_01"), Some(1));
         assert_eq!(m.get(b"c_1"), Some(0));
