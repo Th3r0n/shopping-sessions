@@ -106,7 +106,13 @@ deferred name lookups without the filter check (+0.1%, kept: it is the same resu
 | probe | commit | encodes | score | reading |
 | --- | --- | --- | --- | --- |
 | P1 time | ca191b5 | sleep 10 x own time to output written | 10.28 s | own time T ~0.92 s (fixed + 11 T), vs ~0.56 s locally: 1.63x; fixed cost ~0.1 s |
+| P2 env | 9db3c00 | 0.5 THP never, 1 affinity > NCPU, 2 cold cache, 4 no huge page, 8 CPU quota | 9.04 s | base ~1.04 + 8: a cgroup CPU quota, THP works, warm page cache, affinity <= 8 |
 
 So the score is almost all our process time, on CPUs about 1.6x slower than the local i7 for this code.
 Leaderboard (21 Nov afternoon): #1 0.31 s, then 0.52, 0.52, 0.54, 0.58; we 69th at 1.05. Below 0.50 s needs
 T below ~0.38 s on the scorer, about 2.4x less than now.
+
+Local measurements while another project loads the Docker VM (no free huge pages there, AnonHugePages 0):
+the p20 events parse storing into fresh arenas 0.41 s, into already faulted ones 0.31 s, not storing 0.30 s;
+MADV_POPULATE_WRITE 2 MiB at a time recovers about half (-13%). On the scorer huge pages work (P2), so this
+cost is much smaller there.
