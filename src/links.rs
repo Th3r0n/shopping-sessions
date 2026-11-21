@@ -65,51 +65,47 @@ pub fn prefetch<T>(ptr: *const T) {
     }
 }
 
-/// During the unions a slot's second word holds its node: parent (low 32 bits) and
-/// size (high 32 bits), so following a parent touches the line that holds its key.
+/// Union-find with path halving over dense node numbers.
 #[inline]
-fn parent_of(slots: &[[u64; 2]], x: u32) -> u32 {
-    slots[x as usize][1] as u32
-}
-
-#[inline]
-fn find(slots: &mut [[u64; 2]], mut x: u32) -> u32 {
-    loop {
-        let p = parent_of(slots, x);
-        if p == x {
-            return x;
-        }
-        let grand = parent_of(slots, p);
-        let word = &mut slots[x as usize][1];
-        *word = (*word & !0xffff_ffff) | grand as u64;
+fn find(parent: &mut [u32], mut x: u32) -> u32 {
+    while parent[x as usize] != x {
+        let grand = parent[parent[x as usize] as usize];
+        parent[x as usize] = grand;
         x = grand;
     }
+    x
 }
 
-/// Union-find over every linked ID, directly on the slots of the name table: the
-/// slot of a key is its node. Each pair's slots are prefetched LAG pairs ahead.
+/// Union-find over every linked ID. The big table maps a key to a dense node
+/// number (its slot's second word during the build); the unions run on small
+/// dense arrays; a last sequential pass writes each slot's name.
 pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
     const LAG: usize = 16;
     let t0 = std::time::Instant::now();
     let total: usize = pairs.iter().map(Vec::len).sum();
-    // At most 2 nodes per pair, about 1.4 in practice: 3.5 slots per pair keeps the
-    // load near 0.4 and the table never full.
+    // At most 2 nodes per pair, about 1.4 in practice: 5 slots per pair keeps the
+    // load near 0.3 and the table never full.
     let names = Names::with_slots(total * 5 + 64);
     let size = names.size;
-    let mut occupied: Vec<u32> = Vec::with_capacity(2 * total + 16);
+    let mut keys: Vec<u64> = Vec::with_capacity(2 * total + 16);
+    let mut parent: Vec<u32> = Vec::with_capacity(2 * total + 16);
+    let mut weight: Vec<u32> = Vec::with_capacity(2 * total + 16);
     let t1 = t0.elapsed().as_secs_f64();
 
-    let slot_of = |slots: &mut [[u64; 2]], occupied: &mut Vec<u32>, key: u64| -> u32 {
+    let node_of = |slots: &mut [[u64; 2]], keys: &mut Vec<u64>, parent: &mut Vec<u32>, weight: &mut Vec<u32>, key: u64| -> u32 {
         let mut i = crate::hash::bucket(mix(key), size);
         loop {
             let k = slots[i][0];
             if k == key {
-                return i as u32;
+                return slots[i][1] as u32;
             }
             if k == 0 {
-                slots[i] = [key, (1u64 << 32) | i as u64];
-                occupied.push(i as u32);
-                return i as u32;
+                let node = keys.len() as u32;
+                slots[i] = [key, node as u64];
+                keys.push(key);
+                parent.push(node);
+                weight.push(1);
+                return node;
             }
             i += 1;
             if i == size {
@@ -123,49 +119,41 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
             names.prefetch(x);
             names.prefetch(y);
         }
-        let ia = slot_of(names.slots, &mut occupied, a);
-        let ib = slot_of(names.slots, &mut occupied, b);
-        let ra = find(names.slots, ia);
-        let rb = find(names.slots, ib);
+        let na = node_of(names.slots, &mut keys, &mut parent, &mut weight, a);
+        let nb = node_of(names.slots, &mut keys, &mut parent, &mut weight, b);
+        let ra = find(&mut parent, na);
+        let rb = find(&mut parent, nb);
         if ra != rb {
-            let size_a = names.slots[ra as usize][1] >> 32;
-            let size_b = names.slots[rb as usize][1] >> 32;
-            let (big, small) = if size_a >= size_b { (ra, rb) } else { (rb, ra) };
-            names.slots[small as usize][1] = big as u64;
-            names.slots[big as usize][1] = ((size_a + size_b) << 32) | big as u64;
+            let (big, small) = if weight[ra as usize] >= weight[rb as usize] { (ra, rb) } else { (rb, ra) };
+            parent[small as usize] = big;
+            weight[big as usize] += weight[small as usize];
         }
     }
     let t2 = t0.elapsed().as_secs_f64();
-    // Roots first, then the smallest key of each person in its root's second word,
-    // then that name in every member's second word.
-    let root_of: Vec<u32> = occupied.iter().map(|&i| find(names.slots, i)).collect();
-    for (&i, &r) in occupied.iter().zip(&root_of) {
-        if i == r {
-            names.slots[i as usize][1] = 0;
+    // The smallest key of each root, then each node's name, then every slot's.
+    let n = keys.len();
+    let mut best = vec![0u64; n];
+    for i in 0..n {
+        let r = find(&mut parent, i as u32) as usize;
+        if best[r] == 0 || key::cmp(keys[i], best[r]) == Ordering::Less {
+            best[r] = keys[i];
         }
     }
-    for (n, (&i, &r)) in occupied.iter().zip(&root_of).enumerate() {
-        if let Some(&r2) = root_of.get(n + LAG) {
-            prefetch(names.slots.as_ptr().wrapping_add(r2 as usize));
-        }
-        let k = names.slots[i as usize][0];
-        let best = names.slots[r as usize][1];
-        if best == 0 || key::cmp(k, best) == Ordering::Less {
-            names.slots[r as usize][1] = k;
-        }
+    let mut name_of = vec![0u64; n];
+    for (i, name) in name_of.iter_mut().enumerate() {
+        *name = best[find(&mut parent, i as u32) as usize];
     }
-    for (n, (&i, &r)) in occupied.iter().zip(&root_of).enumerate() {
-        if let Some(&r2) = root_of.get(n + LAG) {
-            prefetch(names.slots.as_ptr().wrapping_add(r2 as usize));
+    for slot in names.slots.iter_mut() {
+        if slot[0] != 0 {
+            slot[1] = name_of[slot[1] as usize];
         }
-        names.slots[i as usize][1] = names.slots[r as usize][1];
     }
     if std::env::var_os("SS_DEBUG").is_some() {
         eprintln!(
             "links: alloc {t1:.3}s, unions {:.3}s, names {:.3}s, {} nodes, {} slots",
             t2 - t1,
             t0.elapsed().as_secs_f64() - t2,
-            occupied.len(),
+            n,
             names.slots.len()
         );
     }
