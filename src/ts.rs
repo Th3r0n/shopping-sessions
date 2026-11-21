@@ -116,6 +116,18 @@ const fn build_month_start() -> [i32; TABLE_YEARS * 12] {
 
 const DAYS_IN_MONTH: [u8; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
+/// Year, month, hour, minute and second of the words "YYYY-MM-" and "HH:MM:SS"
+/// (digits not checked here): each pair of digits is combined in one multiply.
+#[inline(always)]
+fn fields(date: u64, time: u64) -> (u32, u32, u32, u32, u32) {
+    const LOW: u64 = 0x0f0f_0f0f_0f0f_0f0f;
+    // byte i of w * 10 + (w >> 8) is digit i * 10 + digit i + 1 (below 100: no carry)
+    let pairs = |w: u64| (w & LOW).wrapping_mul(10).wrapping_add((w & LOW) >> 8);
+    let (d, t) = (pairs(date), pairs(time));
+    let byte = |w: u64, i: u32| ((w >> (8 * i)) & 0xff) as u32;
+    (byte(d, 0) * 100 + byte(d, 2), byte(d, 5), byte(t, 0), byte(t, 3), byte(t, 6))
+}
+
 /// `YYYY-MM-DDTHH:MM:SS` (the first 19 bytes of F1 and F2) as local milliseconds.
 #[inline(always)]
 fn civil_ms(b: &[u8; 19]) -> Option<i64> {
@@ -141,15 +153,8 @@ fn civil_ms(b: &[u8; 19]) -> Option<i64> {
         | (b[10] != b'T')
         | (d0 > 9)
         | (d1 > 9);
-    let n = date & LOW;
-    let t = time & LOW;
-    let byte = |w: u64, i: u32| ((w >> (8 * i)) & 0xff) as u32;
-    let year = byte(n, 0) * 1000 + byte(n, 1) * 100 + byte(n, 2) * 10 + byte(n, 3);
-    let month = byte(n, 5) * 10 + byte(n, 6);
+    let (year, month, hour, minute, second) = fields(date, time);
     let day = d0 * 10 + d1;
-    let hour = byte(t, 0) * 10 + byte(t, 1);
-    let minute = byte(t, 3) * 10 + byte(t, 4);
-    let second = byte(t, 6) * 10 + byte(t, 7);
     bad |= month.wrapping_sub(1) > 11 || day == 0 || hour > 23 || minute > 59 || second > 59;
     if bad {
         return None;
@@ -197,16 +202,11 @@ pub fn ingest(b: &[u8]) -> i64 {
             & (d0 < 10)
             & (d1 < 10);
         if shape {
-            let n = date & LOW;
-            let t = time & LOW;
-            let byte = |w: u64, i: u32| ((w >> (8 * i)) & 0xff) as i64;
-            let year = byte(n, 0) * 1000 + byte(n, 1) * 100 + byte(n, 2) * 10 + byte(n, 3);
-            let month = byte(n, 5) * 10 + byte(n, 6);
-            let index = (year - TABLE_FIRST_YEAR) * 12 + month - 1;
+            let (year, month, hour, minute, second) = fields(date, time);
+            let index = (year as i64 - TABLE_FIRST_YEAR) * 12 + month as i64 - 1;
             if (0..(TABLE_YEARS * 12) as i64).contains(&index) {
                 let days = MONTH_START[index as usize] as i64 + (d0 * 10 + d1) as i64 - 1;
-                let (hour, minute, second) = (byte(t, 0) * 10 + byte(t, 1), byte(t, 3) * 10 + byte(t, 4), byte(t, 6) * 10 + byte(t, 7));
-                return days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * SECOND;
+                return days * 86_400_000 + hour as i64 * 3_600_000 + minute as i64 * 60_000 + second as i64 * SECOND;
             }
         }
     }
