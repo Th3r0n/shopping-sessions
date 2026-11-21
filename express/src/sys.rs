@@ -4,11 +4,26 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 extern "C" {
     pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     pub fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    pub fn _exit(code: i32) -> !;
+    #[link_name = "_exit"]
+    fn libc_exit(code: i32) -> !;
     fn execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> i32;
     static environ: *const *const c_char;
 }
 use std::ffi::{c_char, CString};
+
+/// libc `_exit`. A build with the `pgo-gen` feature first writes its profile, which the
+/// instrumented runtime would otherwise only do from atexit (never reached here).
+#[inline(always)]
+pub unsafe fn _exit(code: i32) -> ! {
+    #[cfg(feature = "pgo-gen")]
+    {
+        extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        __llvm_profile_write_file();
+    }
+    libc_exit(code)
+}
 pub const PROT_READ: i32 = 1;
 pub const PROT_WRITE: i32 = 2;
 pub const MAP_PRIVATE: i32 = 2;

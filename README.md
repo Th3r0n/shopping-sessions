@@ -11,6 +11,10 @@ Parquet tables `/output/user_daily/` and `/output/campaign_daily/`, following `r
   it as it goes, and re-runs itself in an exact generic mode when the data breaks its assumptions.
   Our changes to it are in the git history after the commit that imports it. It needs AVX-512
   (built for Cascade Lake, the scorer's CPU).
+- **Our build of it: profile-guided optimization.** `express/pgo/merged.profdata` is the profile of an
+  instrumented build (feature `pgo-gen`, `scripts/pgo/`) run on never-scored generator seeds; the
+  Dockerfile compiles with it. It changes code layout and inlining, never what the code computes.
+- **`probe/`: scorer A/B measurements** (`scripts/probe/`, used only in probe commits, never a candidate).
 - **`src/`, `generic/`: our own earlier pipeline** (scored 1.01 s, commit 14b4668), described below.
   It is kept in the repository and its tests, but it is not in the image.
 

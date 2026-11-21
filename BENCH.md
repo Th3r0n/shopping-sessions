@@ -107,6 +107,7 @@ deferred name lookups without the filter check (+0.1%, kept: it is the same resu
 | --- | --- | --- | --- | --- |
 | P1 time | ca191b5 | sleep 10 x own time to output written | 10.28 s | own time T ~0.92 s (fixed + 11 T), vs ~0.56 s locally: 1.63x; fixed cost ~0.1 s |
 | P2 env | 9db3c00 | 0.5 THP never, 1 affinity > NCPU, 2 cold cache, 4 no huge page, 8 CPU quota | 9.04 s | base ~1.04 + 8: a cgroup CPU quota, THP works, warm page cache, affinity <= 8 |
+| P7 ab-io | c235769 | 9 + 30 x (mmap - pread), events parse | 11.80 s | mmap ~ pread on the scorer |
 
 So the score is almost all our process time, on CPUs about 1.6x slower than the local i7 for this code.
 Leaderboard (21 Nov afternoon): #1 0.31 s, then 0.52, 0.52, 0.54, 0.58; we 69th at 1.05. Below 0.50 s needs
@@ -116,3 +117,25 @@ Local measurements while another project loads the Docker VM (no free huge pages
 the p20 events parse storing into fresh arenas 0.41 s, into already faulted ones 0.31 s, not storing 0.30 s;
 MADV_POPULATE_WRITE 2 MiB at a time recovers about half (-13%). On the scorer huge pages work (P2), so this
 cost is much smaller there.
+
+## Fork of Team 67's Express Lane (MIT), 21 Nov evening
+
+`express/` = github.com/jason-scheffel/express-lane @ 92cf412 (see README, LICENSE). Imported unmodified in
+ca6b68e: **0.31 s** on the scorer (BB-493737E4), from 1.01 s.
+
+It needs AVX-512 (built for Cascade Lake). The local i7-12700K has none (SIGILL), so local runs go through
+Intel SDE 10.13.1 (`sde64 -clx`, test-only images, never timed): correctness only. Under SDE, the
+pipeline's fallback re-exec (`/proc/self/exe --generic`) is not followed by Pin and dies of SIGILL, so the
+generic mode is checked by starting it directly (`/pipeline --generic`: same argv and env as the re-exec).
+
+| check (under SDE) | fork ca6b68e | + PGO |
+| --- | --- | --- |
+| 36 fixtures (fast path) | 36/36 | 36/36 |
+| dev vs dev-answer | MATCH | MATCH |
+| p20 vs out-p20 | MATCH | MATCH |
+| diff_seeds, 13 seeds (Feb 29, month, new-year windows) x 2 sizes x 3 settings | 108/108 | 108/108 |
+| fuzz vs reference.py, generic mode | 300/300 (seed 13) | 600/600 (seeds 11, 12) |
+
+Timing cannot be done locally: A/B on the scorer with `probe/` (scripts/probe/Dockerfile.*), which runs
+variants A and B alternately (ABBA, best of 3 each) in one container, then A for real into /output, and ends
+at AB_BASE + AB_SCALE x (A - B) seconds (10 + 100 x by default).

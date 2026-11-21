@@ -10,7 +10,11 @@ WORKDIR /src
 COPY express/Cargo.toml express/Cargo.lock ./
 COPY express/.cargo .cargo
 COPY express/src src
-RUN cargo build --release --target x86_64-unknown-linux-musl \
+# Profile-guided optimization: express/pgo/merged.profdata comes from the instrumented
+# build (feature pgo-gen) run on never-scored generator seeds, scripts/pgo/collect.sh.
+# It changes only code layout and inlining decisions, never what the code computes.
+COPY express/pgo pgo
+RUN cargo rustc --release --target x86_64-unknown-linux-musl -- -Cprofile-use=/src/pgo/merged.profdata \
  && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline
 
 FROM scratch

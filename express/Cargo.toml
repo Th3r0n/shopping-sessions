@@ -14,6 +14,8 @@ knobs = []
 testkeys = []
 pmu = []
 tl = []
+# Profile-guided optimization, step 1: an instrumented build (scripts/pgo.sh).
+pgo-gen = []
 
 [dependencies]
 

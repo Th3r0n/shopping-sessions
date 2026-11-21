@@ -3,7 +3,7 @@
 Runs the image the way the scorer does (same flags as docker_run.sh), from any OS:
     docker_run.py DATA_DIR OUTPUT_DIR
 Env: IMAGE (shopping-sessions:latest), CPUS (8), MEM (24g), CPUSET (optional, e.g. 0-7);
-every SS_* and XL_* variable is passed on to the container.
+every SS_* and XL_* variable is passed on to the container, and NCPU when set (else CPUS).
 Prints the wall time of the container run to stderr.
 """
 import os
@@ -39,7 +39,7 @@ def main():
                "--user", "1000:1000",
                *data_mount(data), "-v", f"{out}:/output", "-v", f"{scratch}:/scratch",
                "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch",
-               "-e", "HOME=/scratch", "-e", f"NCPU={cpus.split('.')[0]}", "-e", f"MEM_GB={mem.rstrip('g')}"]
+               "-e", "HOME=/scratch", "-e", f"NCPU={os.environ.get('NCPU') or cpus.split('.')[0]}", "-e", f"MEM_GB={mem.rstrip('g')}"]
         # Knobs of the pipeline (SS_* ours, XL_* the express-lane ones) reach the container.
         for k, v in sorted(os.environ.items()):
             if k.startswith(("SS_", "XL_")):
