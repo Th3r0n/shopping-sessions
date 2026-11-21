@@ -79,6 +79,23 @@ impl Names {
         }
     }
 
+    /// How many regions `region` cuts the table into: about 256 KiB each, so one
+    /// region's slots stay in the L2 cache while its lookups run.
+    pub fn regions(&self) -> usize {
+        (self.size * 16 / (256 << 10)).clamp(1, 4096)
+    }
+
+    /// The region of the table where `user`'s lookup starts, or None when the
+    /// filter says it names itself (no lookup needed).
+    #[inline]
+    pub fn region(&self, user: u64, regions: usize) -> Option<usize> {
+        let h = mix(user);
+        if !self.maybe_renamed(h) {
+            return None;
+        }
+        Some(crate::hash::bucket(h, self.size) * regions / self.size)
+    }
+
     /// First of two prefetch steps: the filter word.
     #[inline]
     pub fn prefetch_filter(&self, user: u64) {

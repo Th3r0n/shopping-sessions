@@ -81,6 +81,7 @@ pub fn dedup(
     table: &mut Table,
     kept: &mut Vec<PersonEvent>,
     out: &mut Scatter<PersonEvent>,
+    deferred: &mut Scatter<PersonEvent>,
 ) {
     let nc = compact.len();
     let slices = nc + full.len();
@@ -193,24 +194,34 @@ pub fn dedup(
             }
         }
     }
-    // Two prefetch steps: the filter word 2 LAG ahead, then (only for the keys the
-    // filter does not clear) the table slot LAG ahead.
-    for e in kept.iter().take(2 * LAG) {
+    // A user the filter clears is its own person and goes straight to its
+    // partition; the others wait in `deferred`, by names-table region, for
+    // `resolve_deferred` (their lookups then hit a region in cache, not DRAM).
+    let regions = deferred.parts();
+    for e in kept.iter().take(LAG) {
         names.prefetch_filter(e.person);
     }
-    for e in kept.iter().take(LAG) {
-        names.prefetch_if_renamed(e.person);
-    }
     for i in 0..kept.len() {
-        if let Some(far) = kept.get(i + 2 * LAG) {
-            names.prefetch_filter(far.person);
-        }
         if let Some(ahead) = kept.get(i + LAG) {
-            names.prefetch_if_renamed(ahead.person);
+            names.prefetch_filter(ahead.person);
         }
-        let mut e = kept[i];
-        e.person = names.get(e.person);
-        out.push_wc(bucket(mix(e.person), out.parts()), e);
+        let e = kept[i];
+        match names.region(e.person, regions) {
+            None => out.push_wc(bucket(mix(e.person), out.parts()), e),
+            Some(r) => deferred.push_wc(r, e),
+        }
+    }
+}
+
+/// The deferred events of one names-table region (one slice per dedup thread):
+/// their persons, then their person partitions.
+#[inline(never)]
+pub fn resolve_deferred<'a>(events: impl Iterator<Item = &'a [PersonEvent]>, names: &Names, out: &mut Scatter<PersonEvent>) {
+    for part in events {
+        for &e in part {
+            let e = PersonEvent { person: names.get(e.person), packed: e.packed };
+            out.push_wc(bucket(mix(e.person), out.parts()), e);
+        }
     }
 }
 

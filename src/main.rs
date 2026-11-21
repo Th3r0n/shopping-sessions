@@ -223,13 +223,15 @@ fn main() {
     let person_room = est_copies * 13 / 10 / threads;
     let recycle = std::env::var("SS_RECYCLE").as_deref() != Ok("0");
     let next = AtomicUsize::new(0);
-    let person_events: Vec<Scatter<PersonEvent>> =
+    let regions = names.regions();
+    let stage: Vec<(Scatter<PersonEvent>, Scatter<PersonEvent>)> =
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
                     let (event_parts, next) = (&event_parts, &next);
                     s.spawn(move || {
                         let mut evs: Scatter<PersonEvent> = Scatter::new(person_parts, est_copies / threads, person_room);
+                        let mut deferred: Scatter<PersonEvent> = Scatter::new(regions, est_copies / threads / 2, person_room / 2);
                         let mut table = sessions::Table::default();
                         let mut kept = Vec::new();
                         let mut compact: Vec<&[[u64; 3]]> = Vec::with_capacity(8 * event_parts.len());
@@ -241,7 +243,7 @@ fn main() {
                             }
                             compact.extend(event_parts.iter().flat_map(|t| t.compact.part(p)));
                             full.extend(event_parts.iter().flat_map(|t| t.full.part(p)));
-                            sessions::dedup(&compact, &full, base, names, &mut table, &mut kept, &mut evs);
+                            sessions::dedup(&compact, &full, base, names, &mut table, &mut kept, &mut evs, &mut deferred);
                             compact.clear();
                             full.clear();
                             // Partition p is done: its blocks become this thread's
@@ -253,14 +255,35 @@ fn main() {
                                 }
                             }
                         }
-                        evs.finish();
-                        evs
+                        deferred.finish();
+                        (evs, deferred)
                     })
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
     log("deduplicated");
+
+    // Phase 2b: the deferred name lookups, one names-table region at a time.
+    let (mut person_events, deferred): (Vec<Scatter<PersonEvent>>, Vec<Scatter<PersonEvent>>) = stage.into_iter().unzip();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for evs in person_events.iter_mut() {
+            let (deferred, next) = (&deferred, &next);
+            s.spawn(move || {
+                loop {
+                    let r = next.fetch_add(1, Ordering::Relaxed);
+                    if r >= regions {
+                        break;
+                    }
+                    sessions::resolve_deferred(deferred.iter().flat_map(|t| t.part(r)), names, evs);
+                }
+                evs.finish();
+            });
+        }
+    });
+    drop(deferred);
+    log("names resolved");
 
     // Phase 3: sessions per person partition, biggest first.
     let first_day = window.start.div_euclid(DAY);
