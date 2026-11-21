@@ -278,7 +278,100 @@ pub struct Acc {
     cls_tmp: Vec<PersonClick>,
     persons: Vec<u64>,
     ranks: Ranks,
+    /// Per-partition 30-minute buckets: the table, the buckets and the purchases.
+    buckets: Buckets,
+    aggs: Vec<Agg>,
+    aggs_tmp: Vec<Agg>,
+    purchases: Vec<PersonEvent>,
 }
+
+/// The events of one person in one 30-minute bucket of ts: how many, the first
+/// and the last ts. Two events of one bucket are less than 30 minutes apart, so
+/// they always share a session; a session breaks between two buckets exactly when
+/// the next one's first ts is more than 30 minutes after the previous one's last.
+#[derive(Clone, Copy, Default)]
+pub struct Agg {
+    /// The person, then its rank once ranked.
+    pub person: u64,
+    pub bucket: u32,
+    pub count: u32,
+    pub min: u32,
+    pub max: u32,
+}
+
+const BUCKET: u32 = 1_800_000;
+
+/// (person, bucket) -> index in `aggs`: open addressing, generation-stamped.
+#[derive(Default)]
+struct Buckets {
+    /// person, bucket << 32 | generation, index
+    slots: Vec<(u64, u64, u32)>,
+    generation: u32,
+}
+
+impl Buckets {
+    fn reset(&mut self) {
+        if self.slots.is_empty() {
+            self.slots = vec![(0, 0, 0); 1 << 14];
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.slots.iter_mut().for_each(|s| *s = (0, 0, 0));
+            self.generation = 1;
+        }
+    }
+
+    #[inline(always)]
+    fn home(person: u64, bucket: u32, mask: usize) -> usize {
+        ((person ^ (bucket as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xff51_afd7_ed55_8ccd) >> 40) as usize & mask
+    }
+
+    /// Adds an event at ts (relative) to its bucket.
+    #[inline(always)]
+    fn add(&mut self, person: u64, ts: u32, aggs: &mut Vec<Agg>) {
+        let bucket = ts / BUCKET;
+        let tag = (bucket as u64) << 32 | self.generation as u64;
+        let mask = self.slots.len() - 1;
+        let mut i = Self::home(person, bucket, mask);
+        loop {
+            // SAFETY: i <= mask < slots.len().
+            let slot = unsafe { self.slots.get_unchecked_mut(i) };
+            if slot.1 as u32 != self.generation {
+                *slot = (person, tag, aggs.len() as u32);
+                aggs.push(Agg { person, bucket, count: 1, min: ts, max: ts });
+                if aggs.len() * 2 > self.slots.len() {
+                    self.grow(aggs);
+                }
+                return;
+            }
+            if slot.0 == person && slot.1 == tag {
+                // SAFETY: the index came from aggs.len() at insertion.
+                let a = unsafe { aggs.get_unchecked_mut(slot.2 as usize) };
+                a.count += 1;
+                a.min = a.min.min(ts);
+                a.max = a.max.max(ts);
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn grow(&mut self, aggs: &[Agg]) {
+        let size = self.slots.len() * 2;
+        self.slots = vec![(0, 0, 0); size];
+        self.generation = 1;
+        let mask = size - 1;
+        for (idx, a) in aggs.iter().enumerate() {
+            let mut i = Self::home(a.person, a.bucket, mask);
+            while self.slots[i].1 as u32 == self.generation {
+                i = (i + 1) & mask;
+            }
+            self.slots[i] = (a.person, (a.bucket as u64) << 32 | 1, idx as u32);
+        }
+    }
+}
+
+static OLD_SESSIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("SS_SESSIONS").as_deref() == Ok("old"));
 
 impl Acc {
     /// `rows`: about how many user_daily rows this thread will produce.
@@ -304,6 +397,10 @@ impl Acc {
             cls_tmp: Vec::new(),
             persons: Vec::new(),
             ranks: Ranks::default(),
+            buckets: Buckets::default(),
+            aggs: Vec::new(),
+            aggs_tmp: Vec::new(),
+            purchases: Vec::new(),
         }
     }
 
@@ -334,6 +431,9 @@ impl Acc {
         evs: impl Iterator<Item = &'a [PersonEvent]>,
         cls: impl Iterator<Item = &'a [PersonClick]>,
     ) {
+        if !*OLD_SESSIONS {
+            return self.partition_buckets(evs, cls);
+        }
         let mut e = std::mem::take(&mut self.evs);
         let mut c = std::mem::take(&mut self.cls);
         let mut persons = std::mem::take(&mut self.persons);
@@ -425,6 +525,171 @@ impl Acc {
         self.events.push(events);
         self.revenue.push(revenue);
         self.top.push(top);
+    }
+
+    /// `partition` without sorting the events: they are counted into (person,
+    /// 30-minute bucket) aggregates; only the aggregates (ranked, then sorted by
+    /// (rank, bucket)), the purchases and the clicks are sorted.
+    fn partition_buckets<'a>(&mut self, evs: impl Iterator<Item = &'a [PersonEvent]>, cls: impl Iterator<Item = &'a [PersonClick]>) {
+        let mut aggs = std::mem::take(&mut self.aggs);
+        let mut purchases = std::mem::take(&mut self.purchases);
+        let mut c = std::mem::take(&mut self.cls);
+        let mut persons = std::mem::take(&mut self.persons);
+        aggs.clear();
+        purchases.clear();
+        c.clear();
+        persons.clear();
+        self.buckets.reset();
+        self.ranks.reset();
+        let t = crate::prof::start();
+        for part in evs {
+            for x in part {
+                self.buckets.add(x.person, (x.packed >> 32) as u32, &mut aggs);
+                if x.packed & PURCHASE != 0 {
+                    purchases.push(*x);
+                }
+            }
+        }
+        // ranks in order of first bucket; purchases and clicks by the same ranks
+        for a in aggs.iter_mut() {
+            a.person = self.ranks.rank(a.person, &mut persons) as u64;
+        }
+        for p in purchases.iter_mut() {
+            p.person = self.ranks.find(p.person).expect("a purchase has its bucket") as u64;
+        }
+        for part in cls {
+            for x in part {
+                if let Some(rank) = self.ranks.find(x.person) {
+                    c.push(PersonClick { person: rank as u64, ..*x });
+                }
+            }
+        }
+        let t = crate::prof::lap(crate::prof::SESS_RANK, t);
+        let rank_bits = u64::BITS - (persons.len() as u64).leading_zeros();
+        radix_sort(&mut aggs, &mut self.aggs_tmp, 16 + rank_bits, |a| a.person << 16 | a.bucket as u64);
+        radix_sort(&mut purchases, &mut self.evs_tmp, 32 + rank_bits, |x| x.person << 32 | x.packed >> 32);
+        radix_sort(&mut c, &mut self.cls_tmp, 32 + rank_bits, |x| x.person << 32 | x.ts as u64);
+        let t = crate::prof::lap(crate::prof::SESS_SORT, t);
+        let (mut i, mut pi, mut ci) = (0usize, 0usize, 0usize);
+        while i < aggs.len() {
+            let rank = aggs[i].person;
+            let mut j = i + 1;
+            while j < aggs.len() && aggs[j].person == rank {
+                j += 1;
+            }
+            let mut pj = pi;
+            while pj < purchases.len() && purchases[pj].person == rank {
+                pj += 1;
+            }
+            while ci < c.len() && c[ci].person < rank {
+                ci += 1;
+            }
+            let mut cj = ci;
+            while cj < c.len() && c[cj].person == rank {
+                cj += 1;
+            }
+            self.person_buckets(persons[rank as usize], &aggs[i..j], &purchases[pi..pj], &c[ci..cj]);
+            i = j;
+            pi = pj;
+            ci = cj;
+        }
+        crate::prof::lap(crate::prof::SESS_PERSON, t);
+        self.aggs = aggs;
+        self.purchases = purchases;
+        self.cls = c;
+        self.persons = persons;
+    }
+
+    /// `person` from one person's buckets (sorted), purchases and clicks (sorted by ts).
+    #[inline(never)]
+    fn person_buckets(&mut self, person: u64, buckets: &[Agg], purchases: &[PersonEvent], cls: &[PersonClick]) {
+        let first_day = self.shape.first_day;
+        let base = self.shape.base;
+        let (mut lo, mut hi) = (0usize, 0usize);
+        let mut current_day = i64::MIN;
+        let (mut day_sessions, mut day_events, mut day_revenue) = (0i64, 0i64, 0i64);
+        self.categories.clear();
+        let (mut k, mut p) = (0usize, 0usize);
+        while k < buckets.len() {
+            let start = buckets[k].min as i64;
+            let mut last = buckets[k].max;
+            let mut count = buckets[k].count as i64;
+            let mut end = k + 1;
+            while end < buckets.len() && (buckets[end].min - last) as i64 <= GAP {
+                last = buckets[end].max;
+                count += buckets[end].count as i64;
+                end += 1;
+            }
+            let day = (base + start).div_euclid(DAY);
+            if day != current_day {
+                if current_day != i64::MIN {
+                    self.flush(person, current_day, day_sessions, day_events, day_revenue);
+                }
+                current_day = day;
+                day_sessions = 0;
+                day_events = 0;
+                day_revenue = 0;
+                self.categories.clear();
+            }
+            // this session's purchases: every purchase up to its last ts
+            let mut revenue = 0i64;
+            let mut purchased = false;
+            while p < purchases.len() && (purchases[p].packed >> 32) as u32 <= last {
+                let e = purchases[p];
+                let cents = price_of(e.packed) as i64;
+                let category = category_of(e.packed);
+                revenue += cents;
+                purchased = true;
+                match self.categories.iter_mut().find(|c| c.0 == category) {
+                    Some(c) => c.1 += cents,
+                    None => self.categories.push((category, cents)),
+                }
+                p += 1;
+            }
+            day_sessions += 1;
+            day_events += count;
+            day_revenue += revenue;
+
+            while hi < cls.len() && cls[hi].ts as i64 <= start {
+                self.enter(cls[hi].campaign);
+                hi += 1;
+            }
+            let low = start - WEEK;
+            while lo < hi && (cls[lo].ts as i64) < low {
+                self.leave(cls[lo].campaign);
+                lo += 1;
+            }
+            let di = (day - first_day) as usize;
+            let credited = if lo < hi {
+                let last_click = cls[hi - 1].ts;
+                let mut best = hi - 1;
+                let mut b = hi - 1;
+                while b > lo && cls[b - 1].ts == last_click {
+                    b -= 1;
+                    if key::cmp(cls[b].click_id, cls[best].click_id) == Ordering::Less {
+                        best = b;
+                    }
+                }
+                let row = &mut self.assists[di * (self.shape.campaigns + 1)..(di + 1) * (self.shape.campaigns + 1)];
+                for &c in &self.active {
+                    row[c as usize + 1] += 1;
+                }
+                cls[best].campaign as usize + 1
+            } else {
+                0
+            };
+            let s = &mut self.credited[di * (self.shape.campaigns + 1) + credited];
+            s.0 += 1;
+            s.1 += purchased as u32;
+            s.2 += revenue;
+            k = end;
+        }
+        if current_day != i64::MIN {
+            self.flush(person, current_day, day_sessions, day_events, day_revenue);
+        }
+        for c in &cls[lo..hi] {
+            self.leave(c.campaign);
+        }
     }
 
     /// One person's events (sorted by ts) and valid clicks (sorted by ts).
