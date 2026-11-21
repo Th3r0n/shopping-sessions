@@ -11,6 +11,8 @@
 //!   ab-io  the events parse is run from memory maps (A) and with pread (B), twice
 //!         each, before the real run; sleep 9 + 30 x (best A - best B) seconds
 //!   bw    sleep 100 / (memory read bandwidth in GB/s, 8 threads, 1 GiB buffer)
+//!   ab-scatter  the events parse storing its copies (A) and only decoding them (B),
+//!         twice each, before the real run; sleep 9 + 30 x (best A - best B) seconds
 //!   cpu   sleep 1 s if avx512f, + 2 s if avx512bw, + 4 s if avx512vbmi2, + 8 s if AMD
 //!   phase:NAME  sleep 20 x the duration of phase NAME (links, names, parse, dedup,
 //!         resolve, sessions, written: each from the previous mark to its own)
@@ -161,10 +163,10 @@ pub fn finish(mode: &str, started: Instant, cold_secs: f64, ncpu: usize) {
             }
             d
         }
-        "ab-io" => {
+        "ab-io" | "ab-scatter" => {
             let (a, b) = *AB.lock().unwrap();
             if crate::stats::enabled() {
-                eprintln!("probe ab-io: mmap {a:.4}s, pread {b:.4}s");
+                eprintln!("probe {mode}: A {a:.4}s, B {b:.4}s");
             }
             9.0 + 30.0 * (a - b)
         }

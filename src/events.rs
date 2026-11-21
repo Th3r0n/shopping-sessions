@@ -136,9 +136,23 @@ fn price(b: &[u8]) -> Option<u32> {
 
 #[inline]
 pub fn event_fields(f: &[&[u8]; 7], cx: &Context, parts: &mut Copies) {
+    if let Some(copy) = decode_event(f, cx) {
+        store_event(copy, cx, parts);
+    }
+}
+
+/// Probe only: the work of `event_fields` without storing anything (a checksum).
+#[inline]
+pub fn event_fields_dry(f: &[&[u8]; 7], cx: &Context) -> u64 {
+    decode_event(f, cx).map_or(0, |c| c.event_id ^ c.user ^ c.packed ^ c.ingest as u64)
+}
+
+/// A well-formed copy with a non-empty event_id, validated (see EventCopy).
+#[inline(always)]
+fn decode_event(f: &[&[u8]; 7], cx: &Context) -> Option<EventCopy> {
     let [event_id, user, ts, ingest, event_type, product, price_cents] = *f;
     if event_id.is_empty() {
-        return;
+        return None;
     }
     let mut copy = EventCopy {
         event_id: key::key(event_id),
@@ -183,6 +197,11 @@ pub fn event_fields(f: &[&[u8]; 7], cx: &Context, parts: &mut Copies) {
         copy.packed = pack((t - cx.base) as u32, cents, category, flags);
         copy.user = user_key;
     }
+    Some(copy)
+}
+
+#[inline(always)]
+fn store_event(copy: EventCopy, cx: &Context, parts: &mut Copies) {
     let p = bucket(mix(copy.event_id), parts.full.parts());
     let rel = copy.ingest.wrapping_sub(cx.base);
     let seconds = rel / 1000;

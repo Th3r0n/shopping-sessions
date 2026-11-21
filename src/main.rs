@@ -165,7 +165,7 @@ fn main() {
     // the others each parse about 1/(threads-1) of the data. Untouched room costs nothing.
     let busy = if serial_names { threads.saturating_sub(1).max(1) } else { threads };
     // Benchmark and probe only: the events parse alone, once on every thread.
-    let parse_round = |input: &input::Input, chunks: &[input::Chunk]| -> f64 {
+    let parse_round = |input: &input::Input, chunks: &[input::Chunk], dry: bool| -> f64 {
         let room = est_copies * 13 / 10 / threads;
         let next = AtomicUsize::new(0);
         let started = std::time::Instant::now();
@@ -178,11 +178,17 @@ fn main() {
                         full: Scatter::new(eid_parts, est_copies / threads / 16, room / 8),
                     };
                     let mut buf = Vec::new();
+                    let mut sum = 0u64;
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(c) = chunks.get(i) else { break };
-                        input.parse::<7, _>(c, &mut buf, simd, &mut |f| events::event_fields(f, cx, &mut parts));
+                        if dry {
+                            input.parse::<7, _>(c, &mut buf, simd, &mut |f| sum = sum.wrapping_add(events::event_fields_dry(f, cx)));
+                        } else {
+                            input.parse::<7, _>(c, &mut buf, simd, &mut |f| events::event_fields(f, cx, &mut parts));
+                        }
                     }
+                    std::hint::black_box(sum);
                     parts.compact.finish();
                     parts.full.finish();
                     std::hint::black_box(parts.compact.total() + parts.full.total());
@@ -193,7 +199,8 @@ fn main() {
     };
     if let Some(rounds) = env_usize("SS_PARSEBENCH") {
         // the fastest of `rounds` rounds is printed and the process ends
-        let best = (0..rounds.max(1)).map(|_| parse_round(&event_input, &event_chunks)).fold(f64::MAX, f64::min);
+        let dry = std::env::var_os("SS_PARSEBENCH_DRY").is_some();
+        let best = (0..rounds.max(1)).map(|_| parse_round(&event_input, &event_chunks, dry)).fold(f64::MAX, f64::min);
         eprintln!("parsebench: events parsed in {best:.4}s (best of {rounds})");
         exit_now();
     }
@@ -205,8 +212,17 @@ fn main() {
         let pread_chunks = pread_input.chunks(chunk_size);
         let (mut a, mut b) = (f64::MAX, f64::MAX);
         for _ in 0..2 {
-            a = a.min(parse_round(&event_input, &event_chunks));
-            b = b.min(parse_round(&pread_input, &pread_chunks));
+            a = a.min(parse_round(&event_input, &event_chunks, false));
+            b = b.min(parse_round(&pread_input, &pread_chunks, false));
+        }
+        probe::set_ab(a, b);
+    }
+    if probe_mode.as_deref() == Some("ab-scatter") {
+        // the same parse storing its copies (A) and only decoding them (B), alternated
+        let (mut a, mut b) = (f64::MAX, f64::MAX);
+        for _ in 0..2 {
+            a = a.min(parse_round(&event_input, &event_chunks, false));
+            b = b.min(parse_round(&event_input, &event_chunks, true));
         }
         probe::set_ab(a, b);
     }
