@@ -147,6 +147,7 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     log(&format!("links parsed: {} pairs", link_pairs.iter().map(Vec::len).sum::<usize>()));
+    probe::mark("links");
 
     // Phase 1b: the names on every thread (SS_NAMES=serial: on thread 0 while the
     // others start parsing), then events and clicks everywhere.
@@ -155,6 +156,7 @@ fn main() {
     if !serial_names {
         let _ = names_cell.set(links::build_parallel(&link_pairs, threads));
         log("names built");
+        probe::mark("names");
     }
     let event_chunks = event_input.chunks(chunk_size);
     let click_chunks = click_input.chunks(chunk_size);
@@ -268,6 +270,7 @@ fn main() {
         event_parts.iter().map(|t| t.compact.total() + t.full.total()).sum::<usize>(),
         person_clicks.iter().chain(&deferred_clicks).map(Words3::total).sum::<usize>()
     ));
+    probe::mark("parse");
 
     // Phase 2: dedup and route to person partitions.
     let person_room = est_copies * 13 / 10 / threads;
@@ -313,6 +316,7 @@ fn main() {
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
     log("deduplicated");
+    probe::mark("dedup");
 
     // Phase 2b: the deferred name lookups, one names-table region at a time.
     let (mut person_events, deferred): (Vec<Scatter<PersonEvent>>, Vec<Scatter<PersonEvent>>) = stage.into_iter().unzip();
@@ -344,6 +348,7 @@ fn main() {
     drop(deferred);
     drop(deferred_clicks);
     log("names resolved");
+    probe::mark("resolve");
 
     // Phase 3: sessions per person partition, biggest first.
     let first_day = window.start.div_euclid(DAY);
@@ -385,6 +390,7 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     log("sessionized");
+    probe::mark("sessions");
 
     // Phase 4: output.
     let user_dir = out.join("user_daily");
@@ -476,8 +482,9 @@ fn main() {
         String::new()
     };
     log(&format!("written; peak RSS {peak}"));
+    probe::mark("written");
     if let Some(mode) = &probe_mode {
-        probe::finish(mode, started.elapsed().as_secs_f64(), cold, threads);
+        probe::finish(mode, started, cold, threads);
     }
     prof::report();
     // Give the memory back on every thread, then leave without the serial teardown.

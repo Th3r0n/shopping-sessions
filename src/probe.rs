@@ -8,7 +8,26 @@
 //!         took over 15 ms to map); 4 s no transparent huge page obtained by this
 //!         process; 8 s a CPU quota in the cgroup (cpu.max not "max")
 
-use std::time::Duration;
+//!   phase:NAME  sleep 20 x the duration of phase NAME (links, names, parse, dedup,
+//!         resolve, sessions, written: each from the previous mark to its own)
+
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+static MARKS: Mutex<Vec<(&'static str, Instant)>> = Mutex::new(Vec::new());
+
+/// Records the end of a phase (and the start of the next one).
+pub fn mark(name: &'static str) {
+    MARKS.lock().unwrap().push((name, Instant::now()));
+}
+
+/// Seconds from the mark before `name` (or `start`) to the mark `name`.
+fn phase(name: &str, start: Instant) -> f64 {
+    let marks = MARKS.lock().unwrap();
+    let Some(i) = marks.iter().position(|m| m.0 == name) else { return 0.0 };
+    let from = if i == 0 { start } else { marks[i - 1].1 };
+    (marks[i].1 - from).as_secs_f64()
+}
 
 pub fn mode() -> Option<String> {
     std::env::var("SS_PROBE").ok().filter(|m| !m.is_empty())
@@ -67,8 +86,10 @@ pub fn env_delay(cold_secs: f64, ncpu: usize) -> (f64, String) {
 }
 
 /// Sleeps as the probe mode says, once the outputs are written.
-pub fn finish(mode: &str, written_secs: f64, cold_secs: f64, ncpu: usize) {
+pub fn finish(mode: &str, started: Instant, cold_secs: f64, ncpu: usize) {
+    let written_secs = started.elapsed().as_secs_f64();
     let delay = match mode {
+        m if m.starts_with("phase:") => 20.0 * phase(&m[6..], started),
         "time" => 10.0 * written_secs,
         "env" => {
             let (delay, facts) = env_delay(cold_secs, ncpu);
