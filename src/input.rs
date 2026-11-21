@@ -12,6 +12,24 @@ use crate::csv;
 /// Bytes of `\n` after a chunk in its buffer, so SIMD loads never need a bounds check.
 pub const PAD: usize = 128;
 
+static POPULATE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("SS_POPULATE").as_deref() != Ok("0"));
+
+/// Maps a chunk's pages in one call (Linux 5.14+) instead of one fault per page group.
+fn populate(data: &[u8]) {
+    #[cfg(target_os = "linux")]
+    {
+        const MADV_POPULATE_READ: libc::c_int = 22;
+        let start = data.as_ptr() as usize & !4095;
+        let end = data.as_ptr() as usize + data.len();
+        // SAFETY: advice only; a failure (old kernel) is ignored.
+        unsafe {
+            libc::madvise(start as *mut libc::c_void, end - start, MADV_POPULATE_READ);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = data;
+}
+
 pub struct Input {
     pub files: Vec<File>,
     pub lens: Vec<u64>,
@@ -70,6 +88,9 @@ impl Input {
     #[inline]
     pub fn parse<const N: usize, F: FnMut(&[&[u8]; N])>(&self, chunk: &Chunk, buf: &mut Vec<u8>, simd: bool, f: &mut F) {
         if let Some(map) = self.maps.get(chunk.file) {
+            if *POPULATE {
+                populate(&map[chunk.start as usize..chunk.end as usize]);
+            }
             range_lines::<N, F>(map, chunk.start as usize, chunk.end as usize, map.len(), simd, f);
         } else {
             let n = self.read(chunk, buf);
