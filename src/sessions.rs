@@ -13,7 +13,7 @@ use crate::ts::DAY;
 pub const GAP: i64 = 1_800_000;
 pub const NO_CATEGORY: u16 = u16::MAX;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct PersonEvent {
     pub person: u64,
@@ -199,6 +199,11 @@ pub struct Acc {
     categories: Vec<(u16, i64)>,
     evs: Vec<PersonEvent>,
     cls: Vec<PersonClick>,
+    /// Radix sort scratch, the persons by rank and the rank table.
+    evs_tmp: Vec<PersonEvent>,
+    cls_tmp: Vec<PersonClick>,
+    persons: Vec<u64>,
+    ranks: Ranks,
 }
 
 impl Acc {
@@ -220,10 +225,18 @@ impl Acc {
             categories: Vec::new(),
             evs: Vec::new(),
             cls: Vec::new(),
+            evs_tmp: Vec::new(),
+            cls_tmp: Vec::new(),
+            persons: Vec::new(),
+            ranks: Ranks::default(),
         }
     }
 
     /// Processes one person partition, given as one slice per thread.
+    ///
+    /// Each person gets a dense rank (in order of first event); events, then
+    /// clicks, are radix-sorted by (rank, ts), so each person's events and clicks
+    /// form one run in ts order. Clicks of a person without events are dropped.
     #[inline(never)]
     pub fn partition<'a>(
         &mut self,
@@ -232,37 +245,49 @@ impl Acc {
     ) {
         let mut e = std::mem::take(&mut self.evs);
         let mut c = std::mem::take(&mut self.cls);
+        let mut persons = std::mem::take(&mut self.persons);
         e.clear();
         c.clear();
+        persons.clear();
+        self.ranks.reset();
         for part in evs {
-            e.extend_from_slice(part);
+            for x in part {
+                let rank = self.ranks.rank(x.person, &mut persons);
+                e.push(PersonEvent { person: rank as u64, packed: x.packed });
+            }
         }
         for part in cls {
-            c.extend_from_slice(part);
+            for x in part {
+                if let Some(rank) = self.ranks.find(x.person) {
+                    c.push(PersonClick { person: rank as u64, ..*x });
+                }
+            }
         }
-        // (person, packed) as one u128 orders by person then ts (see events::pack).
-        e.sort_unstable_by_key(|x| (x.person as u128) << 64 | x.packed as u128);
-        c.sort_unstable_by_key(|x| (x.person as u128) << 64 | (x.ts as u128) << 32 | x.campaign as u128);
+        let rank_bits = u64::BITS - (persons.len() as u64).leading_zeros();
+        // ts sits in the high 32 bits of packed: the key is (rank, ts).
+        radix_sort(&mut e, &mut self.evs_tmp, 32 + rank_bits, |x| x.person << 32 | x.packed >> 32);
+        radix_sort(&mut c, &mut self.cls_tmp, 32 + rank_bits, |x| x.person << 32 | x.ts as u64);
         let (mut i, mut ci) = (0usize, 0usize);
         while i < e.len() {
-            let person = e[i].person;
+            let rank = e[i].person;
             let mut j = i + 1;
-            while j < e.len() && e[j].person == person {
+            while j < e.len() && e[j].person == rank {
                 j += 1;
             }
-            while ci < c.len() && c[ci].person < person {
+            while ci < c.len() && c[ci].person < rank {
                 ci += 1;
             }
             let mut cj = ci;
-            while cj < c.len() && c[cj].person == person {
+            while cj < c.len() && c[cj].person == rank {
                 cj += 1;
             }
-            self.person(person, &e[i..j], &c[ci..cj]);
+            self.person(persons[rank as usize], &e[i..j], &c[ci..cj]);
             i = j;
             ci = cj;
         }
         self.evs = e;
         self.cls = c;
+        self.persons = persons;
     }
 
     #[inline]
@@ -391,6 +416,128 @@ impl Acc {
         }
         for c in &cls[lo..hi] {
             self.leave(c.campaign);
+        }
+    }
+}
+
+/// Stable LSD radix sort of `v` by the low `bits` bits of `key`, 11 bits a pass
+/// (all histograms counted in one read); passes whose digit never varies are
+/// skipped. `tmp` is scratch.
+fn radix_sort<T: Copy + Default>(v: &mut Vec<T>, tmp: &mut Vec<T>, bits: u32, key: impl Fn(&T) -> u64) {
+    const DIGIT: u32 = 11;
+    const BUCKETS: usize = 1 << DIGIT;
+    let n = v.len();
+    if n < 2 {
+        return;
+    }
+    if n <= 64 {
+        v.sort_by_key(|x| key(x)); // stable, as the passes are
+        return;
+    }
+    let passes = bits.div_ceil(DIGIT) as usize;
+    let mut counts = vec![[0u32; BUCKETS]; passes];
+    for x in v.iter() {
+        let k = key(x);
+        for (p, count) in counts.iter_mut().enumerate() {
+            count[((k >> (p as u32 * DIGIT)) as usize) & (BUCKETS - 1)] += 1;
+        }
+    }
+    tmp.clear();
+    tmp.resize(n, T::default());
+    for (p, count) in counts.iter_mut().enumerate() {
+        if count.iter().any(|&c| c as usize == n) {
+            continue; // every key has the same digit here
+        }
+        let mut at = 0u32;
+        for c in count.iter_mut() {
+            let here = *c;
+            *c = at;
+            at += here;
+        }
+        let shift = p as u32 * DIGIT;
+        for x in v.iter() {
+            let d = ((key(x) >> shift) as usize) & (BUCKETS - 1);
+            // SAFETY: the prefix sums keep every position below n.
+            unsafe { *tmp.get_unchecked_mut(count[d] as usize) = *x };
+            count[d] += 1;
+        }
+        std::mem::swap(v, tmp);
+    }
+}
+
+/// Person -> dense rank for one partition: open addressing over (person, rank +
+/// generation) slots, never cleared (a slot of an older generation is empty).
+#[derive(Default)]
+pub struct Ranks {
+    slots: Vec<(u64, u32, u32)>,
+    generation: u32,
+    len: usize,
+}
+
+impl Ranks {
+    fn reset(&mut self) {
+        if self.slots.is_empty() {
+            self.slots = vec![(0, 0, 0); 4096];
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.slots.iter_mut().for_each(|s| *s = (0, 0, 0));
+            self.generation = 1;
+        }
+        self.len = 0;
+    }
+
+    #[inline]
+    fn find(&self, person: u64) -> Option<u32> {
+        let mask = self.slots.len() - 1;
+        let mut i = mix(person) as usize & mask;
+        loop {
+            let (k, rank, generation) = self.slots[i];
+            if generation != self.generation {
+                return None;
+            }
+            if k == person {
+                return Some(rank);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// The person's rank, a new one (pushed on `persons`) at first sight.
+    #[inline]
+    fn rank(&mut self, person: u64, persons: &mut Vec<u64>) -> u32 {
+        let mask = self.slots.len() - 1;
+        let mut i = mix(person) as usize & mask;
+        loop {
+            let (k, rank, generation) = self.slots[i];
+            if generation != self.generation {
+                let rank = persons.len() as u32;
+                self.slots[i] = (person, rank, self.generation);
+                persons.push(person);
+                self.len += 1;
+                if self.len * 2 > self.slots.len() {
+                    self.grow(persons);
+                }
+                return rank;
+            }
+            if k == person {
+                return rank;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn grow(&mut self, persons: &[u64]) {
+        let size = self.slots.len() * 2;
+        self.slots = vec![(0, 0, 0); size];
+        self.generation = 1;
+        let mask = size - 1;
+        for (rank, &person) in persons.iter().enumerate() {
+            let mut i = mix(person) as usize & mask;
+            while self.slots[i].2 == self.generation {
+                i = (i + 1) & mask;
+            }
+            self.slots[i] = (person, rank as u32, self.generation);
         }
     }
 }
