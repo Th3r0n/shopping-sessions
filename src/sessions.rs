@@ -213,6 +213,18 @@ pub fn dedup(
     }
 }
 
+/// The deferred clicks of one names-table region (one slice per parsing thread):
+/// their persons, then their person partitions.
+#[inline(never)]
+pub fn resolve_deferred_clicks<'a>(clicks: impl Iterator<Item = &'a [[u64; 3]]>, names: &Names, out: &mut crate::arena::Words3) {
+    for part in clicks {
+        for c in PersonClick::of_words(part) {
+            let c = PersonClick { person: names.get(c.person), ..*c };
+            out.push(bucket(mix(c.person), out.parts()), c.words());
+        }
+    }
+}
+
 /// The deferred events of one names-table region (one slice per dedup thread):
 /// their persons, then their person partitions.
 #[inline(never)]

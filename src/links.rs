@@ -104,15 +104,6 @@ impl Names {
         }
     }
 
-    /// Second step, once the filter word has arrived: the slot, if it will be read.
-    #[inline]
-    pub fn prefetch_if_renamed(&self, user: u64) {
-        let h = mix(user);
-        if self.maybe_renamed(h) {
-            prefetch(self.slots.as_ptr().wrapping_add(crate::hash::bucket(h, self.size)));
-        }
-    }
-
     /// Only the slot (while building).
     #[inline]
     fn prefetch_slot(&self, key: u64) {

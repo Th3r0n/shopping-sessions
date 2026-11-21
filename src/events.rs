@@ -94,16 +94,6 @@ impl<T: Copy + Default, const N: usize> Pending<T, N> {
         }
     }
 
-    /// The value pushed `k` pushes before the newest one, if still waiting.
-    #[inline]
-    pub fn back(&self, k: usize) -> Option<&T> {
-        if k < self.len {
-            Some(&self.buf[(self.head + self.len - 1 - k) % N])
-        } else {
-            None
-        }
-    }
-
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
@@ -116,9 +106,9 @@ impl<T: Copy + Default, const N: usize> Pending<T, N> {
     }
 }
 
-/// Clicks wait 2 LAG pushes: the filter word is prefetched when a click goes in,
-/// its table slot (only if the filter does not clear it) LAG pushes later.
-pub type ClickPending = Pending<PersonClick, { 2 * LAG }>;
+/// Clicks wait LAG pushes, the time for their filter word (prefetched when a
+/// click goes in) to arrive.
+pub type ClickPending = Pending<PersonClick, LAG>;
 
 pub struct Context<'a> {
     /// window_start - 7 days: every kept ts is stored relative to it.
@@ -214,6 +204,7 @@ pub fn click_fields(
     names: &Names,
     pending: &mut ClickPending,
     out: &mut Words3,
+    deferred: &mut Words3,
 ) {
     let [click_id, user, campaign, ts] = *f;
     if click_id.is_empty() || user.is_empty() {
@@ -234,20 +225,25 @@ pub fn click_fields(
         ts: (t - cx.base) as u32,
         campaign,
     };
-    if let Some(mut old) = pending.push(click) {
-        old.person = names.get(old.person);
-        out.push(bucket(mix(old.person), out.parts()), old.words());
-    }
-    if let Some(mid) = pending.back(LAG) {
-        names.prefetch_if_renamed(mid.person);
+    if let Some(old) = pending.push(click) {
+        route_click(old, names, out, deferred);
     }
 }
 
-/// Resolves and stores the clicks still waiting in `pending`.
-pub fn flush_clicks(names: &Names, pending: &mut ClickPending, out: &mut Words3) {
-    while let Some(mut old) = pending.pop() {
-        old.person = names.get(old.person);
-        out.push(bucket(mix(old.person), out.parts()), old.words());
+/// A click whose user the filter clears goes to its partition; the others wait
+/// in `deferred`, by names-table region, for their lookup (main's phase 2b).
+#[inline(always)]
+fn route_click(click: PersonClick, names: &Names, out: &mut Words3, deferred: &mut Words3) {
+    match names.region(click.person, deferred.parts()) {
+        None => out.push(bucket(mix(click.person), out.parts()), click.words()),
+        Some(r) => deferred.push(r, click.words()),
+    }
+}
+
+/// Routes the clicks still waiting in `pending`.
+pub fn flush_clicks(names: &Names, pending: &mut ClickPending, out: &mut Words3, deferred: &mut Words3) {
+    while let Some(old) = pending.pop() {
+        route_click(old, names, out, deferred);
     }
 }
 

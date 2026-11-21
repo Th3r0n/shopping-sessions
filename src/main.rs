@@ -155,6 +155,7 @@ fn main() {
     let names_cell: std::sync::OnceLock<links::Names> = std::sync::OnceLock::new();
     let mut event_parts: Vec<events::Copies> = Vec::with_capacity(threads);
     let mut person_clicks: Vec<Words3> = Vec::with_capacity(threads);
+    let mut deferred_clicks: Vec<Words3> = Vec::with_capacity(threads);
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -171,6 +172,8 @@ fn main() {
                         full: Scatter::new(eid_parts, est_copies / threads / 16, event_room / 8),
                     };
                     let mut clicks = Words3::new(person_parts, click_room);
+                    // by names-table region, made once the names exist
+                    let mut deferred: Option<Words3> = None;
                     let mut buf = Vec::new();
                     let mut pending_clicks = events::ClickPending::new();
                     loop {
@@ -185,25 +188,28 @@ fn main() {
                         } else {
                             // Clicks come last; they go straight to their person's partition.
                             let names = names_cell.wait();
+                            let deferred = deferred.get_or_insert_with(|| Words3::new(names.regions(), click_room / 2));
                             click_input.parse::<4, _>(&click_chunks[i - event_chunks.len()], &mut buf, simd, &mut |f| {
-                                events::click_fields(f, cx, names, &mut pending_clicks, &mut clicks)
+                                events::click_fields(f, cx, names, &mut pending_clicks, &mut clicks, deferred)
                             });
                         }
                     }
-                    if let Some(names) = names_cell.get() {
-                        events::flush_clicks(names, &mut pending_clicks, &mut clicks);
-                    }
+                    let names = names_cell.wait();
+                    let mut deferred = deferred.unwrap_or_else(|| Words3::new(names.regions(), 0));
+                    events::flush_clicks(names, &mut pending_clicks, &mut clicks, &mut deferred);
                     parts.compact.finish();
                     parts.full.finish();
                     clicks.finish();
-                    (parts, clicks)
+                    deferred.finish();
+                    (parts, clicks, deferred)
                 })
             })
             .collect();
         for h in handles {
-            let (parts, clicks) = h.join().unwrap();
+            let (parts, clicks, deferred) = h.join().unwrap();
             event_parts.push(parts);
             person_clicks.push(clicks);
+            deferred_clicks.push(deferred);
         }
     });
     let names = names_cell.get().expect("names were built");
@@ -216,7 +222,7 @@ fn main() {
     log(&format!(
         "events parsed: {} copies, {} valid clicks",
         event_parts.iter().map(|t| t.compact.total() + t.full.total()).sum::<usize>(),
-        person_clicks.iter().map(Words3::total).sum::<usize>()
+        person_clicks.iter().chain(&deferred_clicks).map(Words3::total).sum::<usize>()
     ));
 
     // Phase 2: dedup and route to person partitions.
@@ -267,22 +273,32 @@ fn main() {
     // Phase 2b: the deferred name lookups, one names-table region at a time.
     let (mut person_events, deferred): (Vec<Scatter<PersonEvent>>, Vec<Scatter<PersonEvent>>) = stage.into_iter().unzip();
     let next = AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        for evs in person_events.iter_mut() {
-            let (deferred, next) = (&deferred, &next);
-            s.spawn(move || {
-                loop {
-                    let r = next.fetch_add(1, Ordering::Relaxed);
-                    if r >= regions {
-                        break;
+    let click_room = est_clicks * 13 / 10 / threads / 2;
+    let resolved_clicks: Vec<Words3> = std::thread::scope(|s| {
+        let handles: Vec<_> = person_events
+            .iter_mut()
+            .map(|evs| {
+                let (deferred, deferred_clicks, next) = (&deferred, &deferred_clicks, &next);
+                s.spawn(move || {
+                    let mut clicks = Words3::new(person_parts, click_room);
+                    loop {
+                        let r = next.fetch_add(1, Ordering::Relaxed);
+                        if r >= regions {
+                            break;
+                        }
+                        sessions::resolve_deferred(deferred.iter().flat_map(|t| t.part(r)), names, evs);
+                        sessions::resolve_deferred_clicks(deferred_clicks.iter().flat_map(|t| t.part(r)), names, &mut clicks);
                     }
-                    sessions::resolve_deferred(deferred.iter().flat_map(|t| t.part(r)), names, evs);
-                }
-                evs.finish();
-            });
-        }
+                    evs.finish();
+                    clicks.finish();
+                    clicks
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     drop(deferred);
+    drop(deferred_clicks);
     log("names resolved");
 
     // Phase 3: sessions per person partition, biggest first.
@@ -297,7 +313,7 @@ fn main() {
     let mut order: Vec<(usize, usize)> = (0..person_parts)
         .map(|q| {
             let n = person_events.iter().map(|t| t.len(q)).sum::<usize>()
-                + person_clicks.iter().map(|t| t.len(q)).sum::<usize>();
+                + person_clicks.iter().chain(&resolved_clicks).map(|t| t.len(q)).sum::<usize>();
             (n, q)
         })
         .collect();
@@ -306,7 +322,7 @@ fn main() {
     let accs: Vec<Acc> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
-                let (order, person_events, person_clicks, next) = (&order, &person_events, &person_clicks, &next);
+                let (order, person_events, person_clicks, resolved_clicks, next) = (&order, &person_events, &person_clicks, &resolved_clicks, &next);
                 s.spawn(move || {
                     // about 1 user_daily row per 9.5 event copies in the generator's data
                     let mut acc = Acc::new(shape, est_copies / 8 / threads + 1024);
@@ -315,7 +331,7 @@ fn main() {
                         let Some(&(_, q)) = order.get(i) else { break };
                         acc.partition(
                             person_events.iter().flat_map(|t| t.part(q)),
-                            person_clicks.iter().flat_map(|t| t.part(q)).map(PersonClick::of_words),
+                            person_clicks.iter().chain(resolved_clicks).flat_map(|t| t.part(q)).map(PersonClick::of_words),
                         );
                     }
                     acc
