@@ -65,22 +65,26 @@ pub fn prefetch<T>(ptr: *const T) {
     }
 }
 
-/// Union-find with path halving over dense node numbers.
+/// Union-find with path halving over dense nodes: `node[i]` is (parent, size).
 #[inline]
-fn find(parent: &mut [u32], mut x: u32) -> u32 {
-    while parent[x as usize] != x {
-        let grand = parent[parent[x as usize] as usize];
-        parent[x as usize] = grand;
+fn find(node: &mut [[u32; 2]], mut x: u32) -> u32 {
+    while node[x as usize][0] != x {
+        let grand = node[node[x as usize][0] as usize][0];
+        node[x as usize][0] = grand;
         x = grand;
     }
     x
 }
 
 /// Union-find over every linked ID. The big table maps a key to a dense node
-/// number (its slot's second word during the build); the unions run on small
-/// dense arrays; a last sequential pass writes each slot's name.
+/// number (its slot's second word during the build); the unions run on a small
+/// dense array; a last sequential pass writes each slot's name.
+///
+/// Every random access is software-pipelined: the table slots of pair i + 2L are
+/// prefetched, pair i + L gets its node numbers (and its nodes are prefetched),
+/// and pair i is united.
 pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
-    const LAG: usize = 16;
+    const L: usize = 16;
     let t0 = std::time::Instant::now();
     let total: usize = pairs.iter().map(Vec::len).sum();
     // At most 2 nodes per pair, about 1.4 in practice: 5 slots per pair keeps the
@@ -88,11 +92,10 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
     let names = Names::with_slots(total * 5 + 64);
     let size = names.size;
     let mut keys: Vec<u64> = Vec::with_capacity(2 * total + 16);
-    let mut parent: Vec<u32> = Vec::with_capacity(2 * total + 16);
-    let mut weight: Vec<u32> = Vec::with_capacity(2 * total + 16);
+    let mut node: Vec<[u32; 2]> = Vec::with_capacity(2 * total + 16);
     let t1 = t0.elapsed().as_secs_f64();
 
-    let node_of = |slots: &mut [[u64; 2]], keys: &mut Vec<u64>, parent: &mut Vec<u32>, weight: &mut Vec<u32>, key: u64| -> u32 {
+    let node_of = |slots: &mut [[u64; 2]], keys: &mut Vec<u64>, node: &mut Vec<[u32; 2]>, key: u64| -> u32 {
         let mut i = crate::hash::bucket(mix(key), size);
         loop {
             let k = slots[i][0];
@@ -100,12 +103,11 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
                 return slots[i][1] as u32;
             }
             if k == 0 {
-                let node = keys.len() as u32;
-                slots[i] = [key, node as u64];
+                let n = keys.len() as u32;
+                slots[i] = [key, n as u64];
                 keys.push(key);
-                parent.push(node);
-                weight.push(1);
-                return node;
+                node.push([n, 1]);
+                return n;
             }
             i += 1;
             if i == size {
@@ -113,37 +115,76 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
             }
         }
     };
-    let mut ahead = pairs.iter().flatten().skip(LAG);
-    for &(a, b) in pairs.iter().flatten() {
-        if let Some(&(x, y)) = ahead.next() {
+    let mut far = pairs.iter().flatten();
+    let mut near = pairs.iter().flatten();
+    let mut ring = [(0u32, 0u32); L];
+    for &(x, y) in far.by_ref().take(2 * L) {
+        names.prefetch(x);
+        names.prefetch(y);
+    }
+    let prefetch_node = |node: &Vec<[u32; 2]>, n: u32| prefetch(node.as_ptr().wrapping_add(n as usize));
+    for (k, &(a, b)) in near.by_ref().take(L).enumerate() {
+        let na = node_of(names.slots, &mut keys, &mut node, a);
+        let nb = node_of(names.slots, &mut keys, &mut node, b);
+        ring[k] = (na, nb);
+    }
+    for i in 0..total {
+        let (na, nb) = ring[i % L];
+        if let Some(&(x, y)) = far.next() {
             names.prefetch(x);
             names.prefetch(y);
         }
-        let na = node_of(names.slots, &mut keys, &mut parent, &mut weight, a);
-        let nb = node_of(names.slots, &mut keys, &mut parent, &mut weight, b);
-        let ra = find(&mut parent, na);
-        let rb = find(&mut parent, nb);
+        let ra = find(&mut node, na);
+        let rb = find(&mut node, nb);
         if ra != rb {
-            let (big, small) = if weight[ra as usize] >= weight[rb as usize] { (ra, rb) } else { (rb, ra) };
-            parent[small as usize] = big;
-            weight[big as usize] += weight[small as usize];
+            let (big, small) = if node[ra as usize][1] >= node[rb as usize][1] { (ra, rb) } else { (rb, ra) };
+            node[small as usize][0] = big;
+            node[big as usize][1] += node[small as usize][1];
+        }
+        if let Some(&(a, b)) = near.next() {
+            let na = node_of(names.slots, &mut keys, &mut node, a);
+            let nb = node_of(names.slots, &mut keys, &mut node, b);
+            prefetch_node(&node, na);
+            prefetch_node(&node, nb);
+            ring[i % L] = (na, nb);
         }
     }
     let t2 = t0.elapsed().as_secs_f64();
-    // The smallest key of each root, then each node's name, then every slot's.
+    // Each node's root (prefetching the parent of node i + L), then the smallest
+    // key of each root, then each node's name, then every slot's.
     let n = keys.len();
+    for i in 0..n {
+        if let Some(ahead) = node.get(i + L) {
+            prefetch_node(&node, ahead[0]);
+        }
+        let r = find(&mut node, i as u32);
+        node[i][0] = r;
+    }
     let mut best = vec![0u64; n];
     for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
+        if let Some(ahead) = node.get(i + L) {
+            prefetch(best.as_ptr().wrapping_add(ahead[0] as usize));
+        }
+        let r = node[i][0] as usize;
         if best[r] == 0 || key::cmp(keys[i], best[r]) == Ordering::Less {
             best[r] = keys[i];
         }
     }
-    let mut name_of = vec![0u64; n];
-    for (i, name) in name_of.iter_mut().enumerate() {
-        *name = best[find(&mut parent, i as u32) as usize];
+    let mut name_of = keys; // reused: each node's key becomes its name
+    for i in 0..n {
+        if let Some(ahead) = node.get(i + L) {
+            prefetch(best.as_ptr().wrapping_add(ahead[0] as usize));
+        }
+        name_of[i] = best[node[i][0] as usize];
     }
-    for slot in names.slots.iter_mut() {
+    let slots = &mut *names.slots;
+    for j in 0..slots.len() {
+        if let Some(ahead) = slots.get(j + L) {
+            if ahead[0] != 0 {
+                prefetch(name_of.as_ptr().wrapping_add(ahead[1] as usize));
+            }
+        }
+        let slot = &mut slots[j];
         if slot[0] != 0 {
             slot[1] = name_of[slot[1] as usize];
         }
