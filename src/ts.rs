@@ -169,6 +169,46 @@ fn civil_ms(b: &[u8; 19]) -> Option<i64> {
     Some(((days * 24 + hour as i64) * 60 + minute as i64) * 60_000 + second as i64 * SECOND)
 }
 
+/// `ingest_ts`, which rules.md guarantees is a valid F1: checked only for its
+/// shape (digits and separators), not for calendar ranges, then converted with
+/// independent multiplies. Anything else goes through `parse` (None = i64::MAX).
+#[inline(always)]
+pub fn ingest(b: &[u8]) -> i64 {
+    const HIGH: u64 = 0xf0f0_f0f0_f0f0_f0f0;
+    const LOW: u64 = 0x0f0f_0f0f_0f0f_0f0f;
+    if b.len() == 20 {
+        let date = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let time = u64::from_le_bytes(b[11..19].try_into().unwrap());
+        let mid = u32::from_le_bytes(b[8..12].try_into().unwrap()); // "DDTH"
+        let digits_ok = |w: u64, m: u64| {
+            ((w & HIGH ^ 0x3030_3030_3030_3030) & m) | (((w & LOW) + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010 & m) == 0
+        };
+        let (d0, d1) = ((mid & 0xff).wrapping_sub(0x30), (mid >> 8 & 0xff).wrapping_sub(0x30));
+        let shape = digits_ok(date, 0x00ff_ff00_ffff_ffff)
+            & digits_ok(time, 0xffff_00ff_ff00_ffff)
+            & (date & 0xff00_00ff_0000_0000 == 0x2d00_002d_0000_0000)
+            & (time & 0x0000_ff00_00ff_0000 == 0x0000_3a00_003a_0000)
+            & (mid >> 16 & 0xff == b'T' as u32)
+            & (b[19] == b'Z')
+            & (d0 < 10)
+            & (d1 < 10);
+        if shape {
+            let n = date & LOW;
+            let t = time & LOW;
+            let byte = |w: u64, i: u32| ((w >> (8 * i)) & 0xff) as i64;
+            let year = byte(n, 0) * 1000 + byte(n, 1) * 100 + byte(n, 2) * 10 + byte(n, 3);
+            let month = byte(n, 5) * 10 + byte(n, 6);
+            let index = (year - TABLE_FIRST_YEAR) * 12 + month - 1;
+            if (0..(TABLE_YEARS * 12) as i64).contains(&index) {
+                let days = MONTH_START[index as usize] as i64 + (d0 * 10 + d1) as i64 - 1;
+                let (hour, minute, second) = (byte(t, 0) * 10 + byte(t, 1), byte(t, 3) * 10 + byte(t, 4), byte(t, 6) * 10 + byte(t, 7));
+                return days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * SECOND;
+            }
+        }
+    }
+    parse(b).unwrap_or(i64::MAX)
+}
+
 /// UTC milliseconds, or None for a bad timestamp. An F3 value that does not fit in
 /// an i64 is returned as None: it lies outside every window anyway.
 #[inline]
@@ -263,6 +303,26 @@ fn parse_epoch(b: &[u8]) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ingest_matches_parse_on_valid_f1() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..300_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let year = 1900 + (x % 300) as i64;
+            let month = 1 + (x >> 9) % 12;
+            let dim = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(month - 1) as usize]
+                + (month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) as u64;
+            let day = 1 + (x >> 17) % dim;
+            let text = format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", (x >> 23) % 24, (x >> 29) % 60, (x >> 35) % 60);
+            assert_eq!(super::ingest(text.as_bytes()), super::parse(text.as_bytes()).unwrap(), "{text}");
+        }
+        for odd in ["", "2028-01-01T00:00:00", "2028-01-01 00:00:00Z", "1832574986000", "2028-01-01T00:00:00+01:00", "2399-01-01T00:00:00Z"] {
+            assert_eq!(super::ingest(odd.as_bytes()), super::parse(odd.as_bytes()).unwrap_or(i64::MAX), "{odd}");
+        }
+    }
+
     use super::*;
 
     fn f1(s: &str) -> i64 {

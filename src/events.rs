@@ -143,7 +143,7 @@ pub fn event_fields(
     }
     let mut copy = EventCopy {
         event_id: key::key(event_id),
-        ingest: ts::parse(ingest).unwrap_or(i64::MAX),
+        ingest: ts::ingest(ingest),
         user: 0,
         packed: 0,
     };
