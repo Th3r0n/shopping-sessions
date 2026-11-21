@@ -1,5 +1,5 @@
-//! Phase timings on stderr: wall time, and on Linux user/system CPU time and
-//! minor page faults since the previous line.
+//! Phase timings on stderr (only with SS_LOG=1): wall time, and on Linux user/system
+//! CPU time and minor page faults since the previous line.
 
 use std::time::Instant;
 
@@ -31,6 +31,12 @@ fn usage() -> Usage {
     Usage::default()
 }
 
+/// True when SS_LOG=1: phase logs on stderr. Off by default (the scorer reads none).
+pub fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SS_LOG").as_deref() == Ok("1"))
+}
+
 pub struct Stats {
     clock: Instant,
     last_wall: f64,
@@ -47,6 +53,9 @@ impl Stats {
     }
 
     pub fn log(&mut self, what: &str) {
+        if !enabled() {
+            return;
+        }
         let wall = self.clock.elapsed().as_secs_f64();
         let now = usage();
         eprintln!(

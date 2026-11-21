@@ -1,6 +1,8 @@
-//! Reading the CSV folders: files split into line-aligned chunks (planned up
-//! front), each chunk read with pread into a reusable per-thread buffer padded
-//! with `\n`, then split into the well-formed lines' fields (AVX2 when available).
+//! Reading the CSV folders: memory-mapped files cut into byte ranges; the thread
+//! that parses a range finds its first line itself (the lines that start in the
+//! range are its own) and releases the range's pages once parsed. With SS_IO=pread
+//! the chunks are line-aligned up front and read into a buffer padded with `\n`.
+//! Lines are split into fields with AVX2 when available.
 
 use std::fs::File;
 use std::path::Path;
@@ -13,6 +15,27 @@ use crate::csv;
 pub const PAD: usize = 128;
 
 static POPULATE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("SS_POPULATE").as_deref() != Ok("0"));
+static DROP_PAGES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("SS_DROP").as_deref() != Ok("0"));
+
+/// Unmaps the pages wholly inside `data` (a parsed range of a file mapping): the
+/// teardown work is done now, by the parsing threads in parallel, not at exit. A
+/// later read of these bytes just faults them back in from the page cache.
+fn release(data: &[u8]) {
+    #[cfg(target_os = "linux")]
+    {
+        let start = (data.as_ptr() as usize).div_ceil(4096) * 4096;
+        let end = (data.as_ptr() as usize + data.len()) / 4096 * 4096;
+        if end > start {
+            // SAFETY: advice on pages of a read-only file mapping we own; their
+            // contents stay readable (re-faulted from the page cache).
+            unsafe {
+                libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = data;
+}
 
 /// Maps a chunk's pages in one call (Linux 5.14+) instead of one fault per page group.
 fn populate(data: &[u8]) {
@@ -84,14 +107,26 @@ impl Input {
         Self { files, lens, maps }
     }
 
-    /// Calls `f` with the fields of every well-formed line of the chunk.
+    /// Calls `f` with the fields of every well-formed line of the chunk: the data
+    /// lines whose first byte lies in the chunk's range (the file's first line is its
+    /// header; the last line may run past the range's end).
     #[inline]
     pub fn parse<const N: usize, F: FnMut(&[&[u8]; N])>(&self, chunk: &Chunk, buf: &mut Vec<u8>, simd: bool, f: &mut F) {
         if let Some(map) = self.maps.get(chunk.file) {
-            if *POPULATE {
-                populate(&map[chunk.start as usize..chunk.end as usize]);
+            let (start, end) = (chunk.start as usize, chunk.end as usize);
+            // The first line start at or after `start` (start == 0: after the header).
+            let from = start.saturating_sub(1);
+            let Some(nl) = memchr(b'\n', &map[from..]) else { return };
+            let first = from + nl + 1;
+            if first < end {
+                if *POPULATE {
+                    populate(&map[first..end]);
+                }
+                range_lines::<N, F>(map, first, end, map.len(), simd, f);
             }
-            range_lines::<N, F>(map, chunk.start as usize, chunk.end as usize, map.len(), simd, f);
+            if *DROP_PAGES {
+                release(&map[start..end]);
+            }
         } else {
             let n = self.read(chunk, buf);
             range_lines::<N, F>(buf, 0, n, n, simd, f);
@@ -118,11 +153,24 @@ impl Input {
         len
     }
 
-    /// Line-aligned chunks of about `size` bytes covering every data line (the
-    /// first line of each file is its header).
+    /// Chunks of about `size` bytes covering every data line. Mapped files: plain
+    /// byte ranges, nothing read here (see `parse`). SS_IO=pread: line-aligned
+    /// ranges, planned with reads (the first line of each file is its header).
     pub fn chunks(&self, size: usize) -> Vec<Chunk> {
         let size = size.max(1) as u64;
         let mut out = Vec::new();
+        if !self.maps.is_empty() {
+            for file in 0..self.files.len() {
+                let len = self.lens[file];
+                let mut start = 0;
+                while start < len {
+                    let end = (start + size).min(len);
+                    out.push(Chunk { file, start, end });
+                    start = end;
+                }
+            }
+            return out;
+        }
         for file in 0..self.files.len() {
             let len = self.lens[file];
             let mut start = self.next_line_start(file, 0);

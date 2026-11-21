@@ -35,7 +35,9 @@ use ts::DAY;
 fn run_generic(args: &[String]) -> ! {
     let exe = std::env::current_exe().expect("current_exe");
     let generic = exe.with_file_name(format!("shopping-sessions-generic{}", std::env::consts::EXE_SUFFIX));
-    eprintln!("running {}", generic.display());
+    if stats::enabled() {
+        eprintln!("running {}", generic.display());
+    }
     let mut command = std::process::Command::new(&generic);
     command.args(&args[1..]);
     #[cfg(unix)]
@@ -165,7 +167,9 @@ fn main() {
                     if t == 0 {
                         let started = std::time::Instant::now();
                         let _ = names_cell.set(links::build(link_pairs));
-                        eprintln!("           names built in {:.3}s on thread 0", started.elapsed().as_secs_f64());
+                        if stats::enabled() {
+                            eprintln!("           names built in {:.3}s on thread 0", started.elapsed().as_secs_f64());
+                        }
                     }
                     let mut parts = events::Copies {
                         compact: Words3::new(eid_parts, event_room),
@@ -213,12 +217,8 @@ fn main() {
         }
     });
     let names = names_cell.get().expect("names were built");
-    if std::env::var("SS_EARLY_UNMAP").as_deref() != Ok("0") {
-        // Unmapping gigabytes of 4 KiB file pages takes a while: do it now, in the
-        // background, rather than at exit.
-        let inputs = (event_input, click_input, link_input);
-        std::thread::spawn(move || drop(inputs));
-    }
+    // The parsed ranges' pages were released by the parsing threads: unmapping is cheap now.
+    drop((event_input, click_input, link_input));
     log(&format!(
         "events parsed: {} copies, {} valid clicks",
         event_parts.iter().map(|t| t.compact.total() + t.full.total()).sum::<usize>(),
@@ -417,17 +417,39 @@ fn main() {
         if user_sessions != camp_sessions || user_revenue != camp_revenue {
             eprintln!("SELF-CHECK FAILED: sessions {user_sessions} vs {camp_sessions}, revenue {user_revenue} vs {camp_revenue}");
         }
-        eprintln!(
-            "user_daily rows {}, campaign_daily rows {rows}, sessions {user_sessions}, revenue {user_revenue}",
-            accs.iter().map(|a| a.user.len()).sum::<usize>(),
-        );
+        if stats::enabled() {
+            eprintln!(
+                "user_daily rows {}, campaign_daily rows {rows}, sessions {user_sessions}, revenue {user_revenue}",
+                accs.iter().map(|a| a.user.len()).sum::<usize>(),
+            );
+        }
         output::write(&campaign_dir.join("part-00000.parquet"), &[ids, channels, days, sess, purch, rev, assisted])
             .expect("writing campaign_daily");
     });
-    let peak = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")))
-        .unwrap_or_default();
+    let peak = if stats::enabled() {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     log(&format!("written; peak RSS {peak}"));
-    std::process::exit(0);
+    // Give the memory back on every thread, then leave without the serial teardown.
+    if std::env::var("SS_RELEASE").as_deref() != Ok("0") {
+        arena::release_all(threads);
+    }
+    log("released");
+    exit_now();
+}
+
+/// Ends the process at once: the outputs are written and closed, nothing is buffered.
+fn exit_now() -> ! {
+    #[cfg(target_os = "linux")]
+    // SAFETY: _exit only ends the process.
+    unsafe {
+        libc::_exit(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    std::process::exit(0)
 }

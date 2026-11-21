@@ -15,6 +15,46 @@ struct Region<T> {
 #[cfg(target_os = "linux")]
 const HUGE: usize = 2 << 20;
 
+/// Every region mapped so far (start, bytes), for `release_all`.
+#[cfg(target_os = "linux")]
+static MAPPED: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Unmaps every region on `threads` threads, so that the kernel has almost nothing
+/// left to tear down (serially) when the process exits. Nothing may touch arena
+/// memory afterwards: call it right before `_exit`.
+pub fn release_all(threads: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        const PIECE: usize = 64 << 20;
+        let regions = std::mem::take(&mut *MAPPED.lock().unwrap());
+        let mut pieces = Vec::new();
+        for (start, bytes) in regions {
+            let mut at = 0;
+            while at < bytes {
+                let n = PIECE.min(bytes - at);
+                pieces.push((start + at, n));
+                at += n;
+            }
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads.clamp(1, pieces.len().max(1)) {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(start, n)) = pieces.get(i) else { break };
+                    // SAFETY: a piece of a mapping of ours that nothing uses any more
+                    // (the caller exits right after).
+                    unsafe {
+                        libc::munmap(start as *mut libc::c_void, n);
+                    }
+                });
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = threads;
+}
+
 impl<T> Region<T> {
     #[cfg(target_os = "linux")]
     fn new(n: usize) -> Self {
@@ -37,6 +77,7 @@ impl<T> Region<T> {
                 libc::MADV_HUGEPAGE
             };
             libc::madvise(aligned, bytes, advice);
+            MAPPED.lock().unwrap().push((raw as usize, bytes + HUGE));
             Self { ptr: aligned as *mut T }
         }
     }

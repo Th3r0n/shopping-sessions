@@ -37,7 +37,7 @@ def run(args, extra_env):
            "--cpus", args.cpus, "--memory", args.mem, "--memory-swap", args.mem, "--user", "1000:1000",
            *data_mount(args.data),
            "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch", "-e", "HOME=/scratch",
-           "-e", f"NCPU={args.cpus}", "-e", f"MEM_GB={args.mem.rstrip('g')}"]
+           "-e", f"NCPU={args.cpus}", "-e", f"MEM_GB={args.mem.rstrip('g')}", "-e", "SS_LOG=1"]
     # later -e flags override earlier ones (e.g. NCPU)
     if args.cpuset:
         cmd += ["--cpuset-cpus", args.cpuset]
