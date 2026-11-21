@@ -23,6 +23,7 @@ def run(args, extra_env):
            *data_mount(args.data),
            "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch", "-e", "HOME=/scratch",
            "-e", f"NCPU={args.cpus}", "-e", f"MEM_GB={args.mem.rstrip('g')}"]
+    # later -e flags override earlier ones (e.g. NCPU)
     if args.cpuset:
         cmd += ["--cpuset-cpus", args.cpuset]
     for kv in extra_env:

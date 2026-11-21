@@ -36,8 +36,10 @@ def main():
         order = [args.a, args.b] if r % 2 == 0 else [args.b, args.a]
         got = {}
         for image in order:
-            args.image = image
-            wall, log = run(args, args.env)
+            # IMAGE@K=V,K2=V2 runs IMAGE with extra environment variables
+            args.image, _, extra = image.partition("@")
+            env = args.env + [kv for kv in extra.split(",") if kv]
+            wall, log = run(args, env)
             got[image] = wall
             walls[image].append(wall)
             logs[image].append(phases(log))

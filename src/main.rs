@@ -25,7 +25,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arena::Scatter;
-use parquet::data_type::ByteArray;
 
 use events::{Context, EventCopy};
 use output::Column;
@@ -257,25 +256,25 @@ fn main() {
             }
             let path = user_dir.join(format!("part-{t:05}.parquet"));
             s.spawn(move || {
-                let mut top_values = Vec::new();
-                let mut top_levels = Vec::with_capacity(acc.top.len());
-                for &c in &acc.top {
-                    if c == NO_CATEGORY {
-                        top_levels.push(0);
-                    } else {
-                        top_levels.push(1);
-                        top_values.push(ByteArray::from(categories[c as usize].clone()));
+                let rows = acc.user.len();
+                let mut user = Column::strings("user_id", rows);
+                let mut day = Column::dates("day", rows);
+                let mut sessions = Column::int64s("sessions", rows);
+                let mut events = Column::int64s("events", rows);
+                let mut revenue = Column::int64s("revenue_cents", rows);
+                let mut top = Column::optional_strings("top_category", rows);
+                for i in 0..rows {
+                    user.push_str_with(|out| key::bytes_into(acc.user[i], out));
+                    day.push_i32(acc.day[i]);
+                    sessions.push_i64(acc.sessions[i]);
+                    events.push_i64(acc.events[i]);
+                    revenue.push_i64(acc.revenue[i]);
+                    match acc.top[i] {
+                        NO_CATEGORY => top.push_null(),
+                        c => top.push_str(&categories[c as usize]),
                     }
                 }
-                let columns = vec![
-                    Column::Strings(acc.user.iter().map(|&k| ByteArray::from(key::to_bytes(k))).collect()),
-                    Column::Int32(acc.day.clone()),
-                    Column::Int64(acc.sessions.clone()),
-                    Column::Int64(acc.events.clone()),
-                    Column::Int64(acc.revenue.clone()),
-                    Column::OptionalStrings(top_values, top_levels),
-                ];
-                output::write(&path, output::USER_SCHEMA, columns).expect("writing user_daily");
+                output::write(&path, &[user, day, sessions, events, revenue, top]).expect("writing user_daily");
             });
         }
 
@@ -287,50 +286,47 @@ fn main() {
                 }
             }
         }
-        let (mut ids, mut channels, mut days) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut sess, mut purch, mut rev, mut assisted) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let rows = stats.iter().filter(|st| st[0] != 0 || st[3] != 0).count();
+        let mut ids = Column::strings("campaign_id", rows);
+        let mut channels = Column::strings("channel", rows);
+        let mut days = Column::dates("day", rows);
+        let mut sess = Column::int64s("sessions", rows);
+        let mut purch = Column::int64s("purchasing_sessions", rows);
+        let mut rev = Column::int64s("revenue_cents", rows);
+        let mut assisted = Column::int64s("assisted_sessions", rows);
+        let (mut camp_sessions, mut camp_revenue) = (0i64, 0i64);
         for c in 0..=shape.campaigns {
             for d in 0..shape.days {
                 let st = stats[c * shape.days + d];
                 if st[0] == 0 && st[3] == 0 {
                     continue;
                 }
-                let (id, channel) = if c == 0 {
-                    (b"organic".to_vec(), b"organic".to_vec())
+                let (id, channel): (&[u8], &[u8]) = if c == 0 {
+                    (b"organic", b"organic")
                 } else {
-                    (campaigns.ids[c - 1].clone(), campaigns.channels[c - 1].clone())
+                    (&campaigns.ids[c - 1], &campaigns.channels[c - 1])
                 };
-                ids.push(ByteArray::from(id));
-                channels.push(ByteArray::from(channel));
-                days.push((first_day + d as i64) as i32);
-                sess.push(st[0]);
-                purch.push(st[1]);
-                rev.push(st[2]);
-                assisted.push(st[3]);
+                ids.push_str(id);
+                channels.push_str(channel);
+                days.push_i32((first_day + d as i64) as i32);
+                sess.push_i64(st[0]);
+                purch.push_i64(st[1]);
+                rev.push_i64(st[2]);
+                assisted.push_i64(st[3]);
+                camp_sessions += st[0];
+                camp_revenue += st[2];
             }
         }
         let user_sessions: i64 = accs.iter().flat_map(|a| &a.sessions).sum();
         let user_revenue: i64 = accs.iter().flat_map(|a| &a.revenue).sum();
-        let camp_sessions: i64 = sess.iter().sum();
-        let camp_revenue: i64 = rev.iter().sum();
         if user_sessions != camp_sessions || user_revenue != camp_revenue {
             eprintln!("SELF-CHECK FAILED: sessions {user_sessions} vs {camp_sessions}, revenue {user_revenue} vs {camp_revenue}");
         }
         eprintln!(
-            "user_daily rows {}, campaign_daily rows {}, sessions {user_sessions}, revenue {user_revenue}",
+            "user_daily rows {}, campaign_daily rows {rows}, sessions {user_sessions}, revenue {user_revenue}",
             accs.iter().map(|a| a.user.len()).sum::<usize>(),
-            ids.len()
         );
-        let columns = vec![
-            Column::Strings(ids),
-            Column::Strings(channels),
-            Column::Int32(days),
-            Column::Int64(sess),
-            Column::Int64(purch),
-            Column::Int64(rev),
-            Column::Int64(assisted),
-        ];
-        output::write(&campaign_dir.join("part-00000.parquet"), output::CAMPAIGN_SCHEMA, columns)
+        output::write(&campaign_dir.join("part-00000.parquet"), &[ids, channels, days, sess, purch, rev, assisted])
             .expect("writing campaign_daily");
     });
     let peak = std::fs::read_to_string("/proc/self/status")
