@@ -119,18 +119,37 @@ const DAYS_IN_MONTH: [u8; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 /// `YYYY-MM-DDTHH:MM:SS` (the first 19 bytes of F1 and F2) as local milliseconds.
 #[inline(always)]
 fn civil_ms(b: &[u8; 19]) -> Option<i64> {
-    let d = |i: usize| b[i].wrapping_sub(b'0') as u32;
-    let digits = [d(0), d(1), d(2), d(3), d(5), d(6), d(8), d(9), d(11), d(12), d(14), d(15), d(17), d(18)];
-    let mut bad = (b[4] != b'-') | (b[7] != b'-') | (b[10] != b'T') | (b[13] != b':') | (b[16] != b':');
-    for x in digits {
-        bad |= x > 9;
-    }
-    let year = digits[0] * 1000 + digits[1] * 100 + digits[2] * 10 + digits[3];
-    let month = digits[4] * 10 + digits[5];
-    let day = digits[6] * 10 + digits[7];
-    let hour = digits[8] * 10 + digits[9];
-    let minute = digits[10] * 10 + digits[11];
-    let second = digits[12] * 10 + digits[13];
+    // Two little-endian words: "YYYY-MM-" (bytes 0-7) and "HH:MM:SS" (bytes 11-18).
+    // Digits are checked nibble-wise (high nibble 3, low nibble + 6 < 16), which
+    // never carries between bytes; separators by masked comparison.
+    const HIGH: u64 = 0xf0f0_f0f0_f0f0_f0f0;
+    const LOW: u64 = 0x0f0f_0f0f_0f0f_0f0f;
+    let digits_ok = |w: u64, m: u64| {
+        ((w & HIGH ^ 0x3030_3030_3030_3030) & m) | (((w & LOW) + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010 & m) == 0
+    };
+    let date = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let time = u64::from_le_bytes(b[11..19].try_into().unwrap());
+    const DATE_DIGITS: u64 = 0x00ff_ff00_ffff_ffff; // bytes 0,1,2,3,5,6
+    const DATE_SEPS: u64 = 0xff00_00ff_0000_0000; // bytes 4,7: '-'
+    const TIME_DIGITS: u64 = 0xffff_00ff_ff00_ffff; // bytes 0,1,3,4,6,7
+    const TIME_SEPS: u64 = 0x0000_ff00_00ff_0000; // bytes 2,5: ':'
+    let (d0, d1) = (b[8].wrapping_sub(b'0') as u32, b[9].wrapping_sub(b'0') as u32);
+    let mut bad = !digits_ok(date, DATE_DIGITS)
+        | !digits_ok(time, TIME_DIGITS)
+        | (date & DATE_SEPS != 0x2d00_002d_0000_0000)
+        | (time & TIME_SEPS != 0x0000_3a00_003a_0000)
+        | (b[10] != b'T')
+        | (d0 > 9)
+        | (d1 > 9);
+    let n = date & LOW;
+    let t = time & LOW;
+    let byte = |w: u64, i: u32| ((w >> (8 * i)) & 0xff) as u32;
+    let year = byte(n, 0) * 1000 + byte(n, 1) * 100 + byte(n, 2) * 10 + byte(n, 3);
+    let month = byte(n, 5) * 10 + byte(n, 6);
+    let day = d0 * 10 + d1;
+    let hour = byte(t, 0) * 10 + byte(t, 1);
+    let minute = byte(t, 3) * 10 + byte(t, 4);
+    let second = byte(t, 6) * 10 + byte(t, 7);
     bad |= month.wrapping_sub(1) > 11 || day == 0 || hour > 23 || minute > 59 || second > 59;
     if bad {
         return None;
