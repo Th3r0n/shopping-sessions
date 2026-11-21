@@ -102,7 +102,7 @@ pub fn dedup(
                 packed: c.packed,
             };
             if c.packed & RESOLVED != 0 {
-                out.push(bucket(mix(e.person), out.parts()), e);
+                out.push_wc(bucket(mix(e.person), out.parts()), e);
             } else {
                 kept.push(e);
             }
@@ -117,7 +117,7 @@ pub fn dedup(
         }
         let mut e = kept[i];
         e.person = names.get(e.person);
-        out.push(bucket(mix(e.person), out.parts()), e);
+        out.push_wc(bucket(mix(e.person), out.parts()), e);
     }
 }
 

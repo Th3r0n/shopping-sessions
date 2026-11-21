@@ -188,6 +188,7 @@ fn main() {
                         events::flush_events(names, &mut pending_events, &mut parts);
                         events::flush_clicks(names, &mut pending_clicks, &mut clicks);
                     }
+                    parts.finish();
                     (parts, clicks)
                 })
             })
@@ -227,6 +228,7 @@ fn main() {
                             slices.extend(event_parts.iter().flat_map(|t| t.part(p)));
                             sessions::dedup(&slices, names, &mut table, &mut kept, &mut evs);
                         }
+                        evs.finish();
                         evs
                     })
                 })

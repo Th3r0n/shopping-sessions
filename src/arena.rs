@@ -43,9 +43,12 @@ impl<T> Region<T> {
 
     #[cfg(not(target_os = "linux"))]
     fn new(n: usize) -> Self {
-        let mut keep = Vec::with_capacity(n.max(1));
-        let ptr = keep.as_mut_ptr() as *mut T;
-        Self { ptr, _keep: keep }
+        let bytes = (n.max(1) * std::mem::size_of::<T>()).max(64);
+        let layout = std::alloc::Layout::from_size_align(bytes, 4096).unwrap();
+        // SAFETY: a non-zero-sized layout; the memory is never freed (the process ends first).
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut T;
+        assert!(!ptr.is_null(), "allocation of {bytes} bytes failed");
+        Self { ptr, _keep: Vec::new() }
     }
 }
 
@@ -77,7 +80,32 @@ pub struct Scatter<T: Copy> {
     current: Vec<usize>,
     fill: Vec<usize>,
     overflow: Vec<Vec<T>>,
+    /// Software write-combining: per partition, one cache line of values waiting
+    /// to be written with non-temporal stores (when a line holds whole values).
+    staging: Vec<Line>,
+    staged: Vec<u8>,
+    per_line: usize,
     _marker: PhantomData<T>,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Line([u8; 64]);
+
+/// Copies one 64-byte line with non-temporal stores (no read of the destination).
+#[inline(always)]
+unsafe fn stream_line(dst: *mut u8, src: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        let (d, s) = (dst as *mut __m128i, src as *const __m128i);
+        _mm_stream_si128(d, _mm_load_si128(s));
+        _mm_stream_si128(d.add(1), _mm_load_si128(s.add(1)));
+        _mm_stream_si128(d.add(2), _mm_load_si128(s.add(2)));
+        _mm_stream_si128(d.add(3), _mm_load_si128(s.add(3)));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    std::ptr::copy_nonoverlapping(src, dst, 64);
 }
 
 // SAFETY: a Scatter owns its memory exclusively, like a Vec<T>.
@@ -88,7 +116,12 @@ impl<T: Copy> Scatter<T> {
     /// `parts` partitions, about `expected` values in all (an estimate), room for
     /// `capacity` values in the arena before spilling into Vecs.
     pub fn new(parts: usize, expected: usize, capacity: usize) -> Self {
-        let block = (expected / parts.max(1) / 8).clamp(16, 1024);
+        let size = std::mem::size_of::<T>();
+        let per_line = if size > 0 && size <= 64 && 64 % size == 0 { 64 / size } else { 0 };
+        let mut block = (expected / parts.max(1) / 8).clamp(16, 1024);
+        if per_line > 0 {
+            block = block.div_ceil(per_line) * per_line; // blocks are whole lines
+        }
         let capacity = capacity + parts * block;
         Self {
             region: Region::new(capacity),
@@ -99,8 +132,70 @@ impl<T: Copy> Scatter<T> {
             current: vec![0; parts],
             fill: vec![block; parts],
             overflow: (0..parts).map(|_| Vec::new()).collect(),
+            staging: vec![Line([0; 64]); if per_line > 0 { parts } else { 0 }],
+            staged: vec![0; parts],
+            per_line,
             _marker: PhantomData,
         }
+    }
+
+    /// Like push, through the partition's staging line (T must divide 64 bytes).
+    /// `finish` must run before the values are read.
+    #[inline]
+    pub fn push_wc(&mut self, p: usize, value: T) {
+        debug_assert!(self.per_line > 0);
+        let n = self.staged[p] as usize;
+        // SAFETY: n < per_line, so the value lies inside the 64-byte line.
+        unsafe { (self.staging.as_mut_ptr().add(p) as *mut T).add(n).write(value) };
+        if n + 1 < self.per_line {
+            self.staged[p] = (n + 1) as u8;
+        } else {
+            self.staged[p] = 0;
+            self.flush_line(p);
+        }
+    }
+
+    #[inline]
+    fn flush_line(&mut self, p: usize) {
+        if self.fill[p] == self.block {
+            if self.used + self.block > self.capacity {
+                // SAFETY: the staging line holds per_line written values.
+                let values =
+                    unsafe { std::slice::from_raw_parts(self.staging.as_ptr().add(p) as *const T, self.per_line) };
+                self.overflow[p].extend_from_slice(values);
+                return;
+            }
+            let start = self.used;
+            self.used += self.block;
+            self.blocks[p].push((start / self.block) as u32);
+            self.current[p] = start;
+            self.fill[p] = 0;
+        }
+        // SAFETY: blocks are whole, 64-byte aligned lines and fill counts whole lines.
+        unsafe {
+            let dst = self.region.ptr.add(self.current[p] + self.fill[p]) as *mut u8;
+            stream_line(dst, self.staging.as_ptr().add(p) as *const u8);
+        }
+        self.fill[p] += self.per_line;
+    }
+
+    /// Writes out the partly filled staging lines; after this only `push` may be used.
+    pub fn finish(&mut self) {
+        for p in 0..self.staged.len() {
+            let n = self.staged[p] as usize;
+            for i in 0..n {
+                // SAFETY: the first n values of the line were written by push_wc.
+                let value = unsafe { (self.staging.as_ptr().add(p) as *const T).add(i).read() };
+                self.push(p, value);
+            }
+            self.staged[p] = 0;
+        }
+        self.per_line = 0;
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a store fence orders the non-temporal stores before later ones.
+        unsafe {
+            std::arch::x86_64::_mm_sfence()
+        };
     }
 
     pub fn parts(&self) -> usize {
@@ -164,6 +259,21 @@ impl<T: Copy> Scatter<T> {
 #[cfg(test)]
 mod tests {
     use super::Scatter;
+
+    #[test]
+    fn write_combining_matches() {
+        for capacity in [0, 7, 64, 100, 5000] {
+            let mut s: Scatter<[u64; 4]> = Scatter::new(5, 300, capacity);
+            for i in 0..3001u64 {
+                s.push_wc((i * 7 % 5) as usize, [i, i + 1, i + 2, i + 3]);
+            }
+            s.finish();
+            for p in 0..5 {
+                let all: Vec<u64> = s.part(p).flatten().map(|v| v[0]).collect();
+                assert_eq!(all, (0..3001).filter(|i| i * 7 % 5 == p as u64).collect::<Vec<_>>());
+            }
+        }
+    }
 
     #[test]
     fn blocks_spill_and_keep_order() {

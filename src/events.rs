@@ -170,20 +170,20 @@ pub fn event_fields(
             copy.packed |= RESOLVED;
             if let Some(mut old) = pending.push(copy) {
                 old.user = names.get(old.user);
-                parts.push(bucket(mix(old.event_id), parts.parts()), old);
+                parts.push_wc(bucket(mix(old.event_id), parts.parts()), old);
             }
             return;
         }
     }
     let p = bucket(mix(copy.event_id), parts.parts());
-    parts.push(p, copy);
+    parts.push_wc(p, copy);
 }
 
 /// Resolves and stores what is still waiting in `pending`.
 pub fn flush_events(names: &Names, pending: &mut Pending<EventCopy>, parts: &mut Scatter<EventCopy>) {
     while let Some(mut old) = pending.pop() {
         old.user = names.get(old.user);
-        parts.push(bucket(mix(old.event_id), parts.parts()), old);
+        parts.push_wc(bucket(mix(old.event_id), parts.parts()), old);
     }
 }
 
