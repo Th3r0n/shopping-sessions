@@ -49,6 +49,12 @@ pub struct IdMap {
     mask: usize,
     len: usize,
     other: std::collections::HashMap<Vec<u8>, u32>,
+    /// Every ID inserted, until `seal`.
+    ids: Vec<Vec<u8>>,
+    /// When every ID is `prefix` + a canonical decimal number (like `c_123`), the
+    /// values indexed by that number (value + 1; 0 = absent): any other string
+    /// cannot be one of the IDs.
+    direct: Option<(Vec<u8>, Vec<u32>)>,
 }
 
 impl IdMap {
@@ -58,7 +64,29 @@ impl IdMap {
             mask: 15,
             len: 0,
             other: std::collections::HashMap::new(),
+            ids: Vec::new(),
+            direct: None,
         }
+    }
+
+    /// Builds the direct index when every ID has the `prefix` + number shape.
+    fn seal(&mut self) {
+        let ids = std::mem::take(&mut self.ids);
+        let Some(first) = ids.first() else { return };
+        let prefix: Vec<u8> = first.iter().take_while(|b| !b.is_ascii_digit()).copied().collect();
+        let number = |id: &[u8]| -> Option<usize> { canonical(id.strip_prefix(prefix.as_slice())?) };
+        if prefix.is_empty() || !ids.iter().all(|id| number(id).is_some()) {
+            return;
+        }
+        let max = ids.iter().filter_map(|id| number(id)).max().unwrap_or(0);
+        if max > 4 * ids.len() + 1024 {
+            return; // too sparse for a table
+        }
+        let mut table = vec![0u32; max + 1];
+        for id in &ids {
+            table[number(id).unwrap()] = self.get_hashed(id).unwrap() + 1;
+        }
+        self.direct = Some((prefix, table));
     }
 
     fn insert_packed(&mut self, k: u64, value: u32) {
@@ -89,6 +117,7 @@ impl IdMap {
     }
 
     fn insert(&mut self, id: &[u8], value: u32) {
+        self.ids.push(id.to_vec());
         match key::pack(id) {
             Some(k) => self.insert_packed(k, value),
             None => {
@@ -99,6 +128,18 @@ impl IdMap {
 
     #[inline]
     pub fn get(&self, id: &[u8]) -> Option<u32> {
+        if let Some((prefix, table)) = &self.direct {
+            let n = canonical(id.strip_prefix(prefix.as_slice())?)?;
+            return match table.get(n) {
+                Some(&v) if v != 0 => Some(v - 1),
+                _ => None,
+            };
+        }
+        self.get_hashed(id)
+    }
+
+    #[inline]
+    fn get_hashed(&self, id: &[u8]) -> Option<u32> {
         match key::pack(id) {
             Some(k) => {
                 let mut i = mix(k) as usize & self.mask;
@@ -116,6 +157,23 @@ impl IdMap {
             None => self.other.get(id).copied(),
         }
     }
+}
+
+/// A canonical decimal number (ASCII digits, no leading zero, at most 9 digits).
+#[inline]
+fn canonical(digits: &[u8]) -> Option<usize> {
+    if digits.is_empty() || digits.len() > 9 || (digits[0] == b'0' && digits.len() > 1) {
+        return None;
+    }
+    let mut n = 0usize;
+    for &c in digits {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        n = n * 10 + d as usize;
+    }
+    Some(n)
 }
 
 pub struct Products {
@@ -144,6 +202,7 @@ impl Products {
         for (product, category) in &rows {
             map.insert(product, id_of(category) as u32);
         }
+        map.seal();
         Self { map, categories, unknown }
     }
 
@@ -174,11 +233,40 @@ impl Campaigns {
                 channels.push(channel.to_vec());
             }
         });
+        map.seal();
         Self { map, ids, channels }
     }
 
     #[inline]
     pub fn get(&self, campaign: &[u8]) -> Option<u32> {
         self.map.get(campaign)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_index_is_exact() {
+        let mut m = IdMap::new();
+        for i in 1..=2000u32 {
+            m.insert(format!("c_{i}").as_bytes(), i - 1);
+        }
+        m.seal();
+        assert!(m.direct.is_some());
+        for (id, want) in [("c_1", Some(0)), ("c_2000", Some(1999)), ("c_2001", None), ("c_0", None), ("c_012", None),
+                           ("C_12", None), ("c_", None), ("c_1 ", None), ("c_12x", None), ("x_12", None), ("", None),
+                           ("c_99999999999", None)] {
+            assert_eq!(m.get(id.as_bytes()), want, "{id}");
+        }
+        // a map whose IDs are not all prefix + number keeps the hashed lookup
+        let mut m = IdMap::new();
+        m.insert(b"c_1", 0);
+        m.insert(b"c_01", 1);
+        m.seal();
+        assert!(m.direct.is_none());
+        assert_eq!(m.get(b"c_01"), Some(1));
+        assert_eq!(m.get(b"c_1"), Some(0));
     }
 }
