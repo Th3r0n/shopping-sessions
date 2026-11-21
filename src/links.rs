@@ -10,22 +10,29 @@ use crate::key;
 /// (key, name) per entry, so a lookup touches a single cache line. Key 0 is empty.
 pub struct Names {
     slots: &'static mut [[u64; 2]],
-    mask: usize,
+    size: usize,
 }
 
 impl Names {
-    fn with_entries(n: usize) -> Self {
-        let size = (n.max(8) * 2).next_power_of_two();
+    /// A table of exactly `size` slots (any size: home slots by multiply-shift).
+    fn with_slots(size: usize) -> Self {
+        let size = size.max(16);
+        assert!(size < u32::MAX as usize, "name table too large");
         Self {
             slots: crate::arena::zeroed_slice(size),
-            mask: size - 1,
+            size,
         }
+    }
+
+    #[inline]
+    fn home(&self, key: u64) -> usize {
+        crate::hash::bucket(mix(key), self.size)
     }
 
     /// The person's name for a user key: itself if it appears in no link.
     #[inline]
     pub fn get(&self, user: u64) -> u64 {
-        let mut i = mix(user) as usize & self.mask;
+        let mut i = self.home(user);
         loop {
             let [k, name] = self.slots[i];
             if k == user {
@@ -34,14 +41,17 @@ impl Names {
             if k == 0 {
                 return user;
             }
-            i = (i + 1) & self.mask;
+            i += 1;
+            if i == self.size {
+                i = 0;
+            }
         }
     }
 
     /// Starts loading the slot `get(user)` will read first.
     #[inline]
     pub fn prefetch(&self, user: u64) {
-        let i = mix(user) as usize & self.mask;
+        let i = self.home(user);
         prefetch(self.slots.as_ptr().wrapping_add(i));
     }
 }
@@ -82,13 +92,15 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
     const LAG: usize = 16;
     let t0 = std::time::Instant::now();
     let total: usize = pairs.iter().map(Vec::len).sum();
-    let names = Names::with_entries(2 * total + 16);
-    let mask = names.mask;
+    // At most 2 nodes per pair, about 1.4 in practice: 3.5 slots per pair keeps the
+    // load near 0.4 and the table never full.
+    let names = Names::with_slots(total * 5 + 64);
+    let size = names.size;
     let mut occupied: Vec<u32> = Vec::with_capacity(2 * total + 16);
     let t1 = t0.elapsed().as_secs_f64();
 
     let slot_of = |slots: &mut [[u64; 2]], occupied: &mut Vec<u32>, key: u64| -> u32 {
-        let mut i = mix(key) as usize & mask;
+        let mut i = crate::hash::bucket(mix(key), size);
         loop {
             let k = slots[i][0];
             if k == key {
@@ -99,7 +111,10 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
                 occupied.push(i as u32);
                 return i as u32;
             }
-            i = (i + 1) & mask;
+            i += 1;
+            if i == size {
+                i = 0;
+            }
         }
     };
     let mut ahead = pairs.iter().flatten().skip(LAG);
