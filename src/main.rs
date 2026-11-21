@@ -229,7 +229,7 @@ fn main() {
                     let (event_parts, next) = (&event_parts, &next);
                     s.spawn(move || {
                         let mut evs: Scatter<PersonEvent> = Scatter::new(person_parts, est_copies / threads, person_room);
-                        let mut table = Vec::new();
+                        let mut table = sessions::Table::default();
                         let mut kept = Vec::new();
                         let mut slices: Vec<&[EventCopy]> = Vec::with_capacity(2 * event_parts.len());
                         loop {

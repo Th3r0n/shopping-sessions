@@ -36,6 +36,16 @@ pub struct Slot {
     event_id: u64,
     /// Position of the kept copy among the partition's copies, in slice order.
     at: u32,
+    /// The partition this entry belongs to: an entry of an earlier one is empty,
+    /// so the table is never cleared.
+    generation: u32,
+}
+
+/// A dedup table reused across partitions without clearing it.
+#[derive(Default)]
+pub struct Table {
+    slots: Vec<Slot>,
+    generation: u32,
 }
 
 /// Keeps, per event_id, the copy with the smallest ingest_ts (copies tied on it are
@@ -45,7 +55,7 @@ pub struct Slot {
 pub fn dedup(
     parts: &[&[EventCopy]],
     names: &Names,
-    table: &mut Vec<Slot>,
+    table: &mut Table,
     kept: &mut Vec<PersonEvent>,
     out: &mut Scatter<PersonEvent>,
 ) {
@@ -65,16 +75,25 @@ pub fn dedup(
     };
     let slots = (n * 2).next_power_of_two();
     let mask = slots - 1;
-    table.clear();
-    table.resize(slots, Slot::default());
+    if table.slots.len() < slots {
+        table.slots.resize(slots, Slot::default());
+    }
+    table.generation = table.generation.wrapping_add(1);
+    if table.generation == 0 {
+        // after 2^32 partitions: start over from a clean table
+        table.slots.iter_mut().for_each(|s| *s = Slot::default());
+        table.generation = 1;
+    }
+    let generation = table.generation;
+    let table = &mut table.slots[..slots];
     for (k, part) in parts.iter().enumerate() {
         for (o, c) in part.iter().enumerate() {
             let at = (((k as u64) << shift) | o as u64) as u32;
             let mut i = mix(c.event_id) as usize & mask;
             loop {
                 let s = &mut table[i];
-                if s.event_id == 0 {
-                    *s = Slot { event_id: c.event_id, at };
+                if s.generation != generation {
+                    *s = Slot { event_id: c.event_id, at, generation };
                     break;
                 }
                 if s.event_id == c.event_id {
@@ -92,7 +111,7 @@ pub fn dedup(
     // cache, so each one is prefetched LAG entries ahead.
     kept.clear();
     for s in table.iter() {
-        if s.event_id == 0 {
+        if s.generation != generation {
             continue;
         }
         let c = copy_at(s.at);
