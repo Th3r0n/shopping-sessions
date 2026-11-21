@@ -31,7 +31,12 @@ impl<T> Region<T> {
             );
             assert!(raw != libc::MAP_FAILED, "mmap of {bytes} bytes failed");
             let aligned = ((raw as usize + HUGE - 1) & !(HUGE - 1)) as *mut libc::c_void;
-            libc::madvise(aligned, bytes, libc::MADV_HUGEPAGE);
+            let advice = if std::env::var("SS_THP").as_deref() == Ok("0") {
+                libc::MADV_NOHUGEPAGE
+            } else {
+                libc::MADV_HUGEPAGE
+            };
+            libc::madvise(aligned, bytes, advice);
             Self { ptr: aligned as *mut T }
         }
     }
@@ -100,23 +105,6 @@ impl<T: Copy> Scatter<T> {
     pub fn total(&self) -> usize {
         (0..self.parts()).map(|p| self.len(p)).sum()
     }
-}
-
-/// Maps the pages of `data` in one call (Linux 5.14+), instead of one fault per page.
-#[inline]
-pub fn populate(data: &[u8]) {
-    #[cfg(target_os = "linux")]
-    {
-        const MADV_POPULATE_READ: libc::c_int = 22;
-        let start = data.as_ptr() as usize & !4095;
-        let end = data.as_ptr() as usize + data.len();
-        // SAFETY: advice only; failure (old kernel) is harmless and ignored.
-        unsafe {
-            libc::madvise(start as *mut libc::c_void, end - start, MADV_POPULATE_READ);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = data;
 }
 
 #[cfg(test)]

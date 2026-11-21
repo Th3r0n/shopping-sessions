@@ -12,6 +12,7 @@ mod arena;
 mod csv;
 mod events;
 mod hash;
+mod input;
 mod key;
 mod links;
 mod lookups;
@@ -20,74 +21,16 @@ mod sessions;
 mod stats;
 mod ts;
 
-use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arena::Scatter;
-use memmap2::Mmap;
 use parquet::data_type::ByteArray;
 
 use events::{Click, Context, EventCopy};
 use output::Column;
 use sessions::{Acc, PersonClick, PersonEvent, Shape, NO_CATEGORY};
 use ts::DAY;
-
-struct Chunk {
-    file: usize,
-    first: usize,
-    start: usize,
-    end: usize,
-}
-
-fn list_csv(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.ends_with(".csv") && !name.starts_with('.') && e.path().is_file()
-        })
-        .map(|e| e.path())
-        .collect();
-    paths.sort();
-    paths
-}
-
-fn map_files(dir: &Path) -> Vec<Mmap> {
-    list_csv(dir)
-        .into_iter()
-        .filter_map(|path| {
-            let file = File::open(&path).unwrap_or_else(|e| panic!("opening {}: {e}", path.display()));
-            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-            if len == 0 {
-                return None;
-            }
-            // SAFETY: the inputs are read-only and nothing modifies them while we run.
-            let map = unsafe { Mmap::map(&file) }.unwrap_or_else(|e| panic!("mapping {}: {e}", path.display()));
-            Some(map)
-        })
-        .collect()
-}
-
-fn chunks(maps: &[Mmap], size: usize) -> Vec<Chunk> {
-    let mut out = Vec::new();
-    for (file, map) in maps.iter().enumerate() {
-        let Some(first) = csv::data_start(map) else {
-            continue;
-        };
-        let mut start = first;
-        while start < map.len() {
-            let end = (start + size).min(map.len());
-            out.push(Chunk { file, first, start, end });
-            start = end;
-        }
-    }
-    out
-}
 
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.trim().parse().ok()
@@ -117,18 +60,19 @@ fn main() {
     let window = lookups::read_manifest(&data);
     let products = lookups::Products::read(&data);
     let campaigns = lookups::Campaigns::read(&data);
-    let event_maps = map_files(&data.join("events"));
-    let click_maps = map_files(&data.join("clicks"));
-    let link_maps = map_files(&data.join("links"));
-    let event_bytes: usize = event_maps.iter().map(|m| m.len()).sum();
-    let click_bytes: usize = click_maps.iter().map(|m| m.len()).sum();
+    let event_input = input::Input::open(&data.join("events"));
+    let click_input = input::Input::open(&data.join("clicks"));
+    let link_input = input::Input::open(&data.join("links"));
+    let event_bytes = event_input.bytes() as usize;
+    let click_bytes = click_input.bytes() as usize;
+    let simd = input::use_simd();
     let est_copies = event_bytes / 75 + 1;
     let eid_parts = env_usize("SS_PARTS").unwrap_or((est_copies / 16_384).clamp(1, 4096)).max(1);
     let person_parts = env_usize("SS_PARTS").unwrap_or((est_copies / 32_768).clamp(1, 4096)).max(1);
     log(&format!(
-        "threads {threads}, events {event_bytes} B in {} files, clicks {click_bytes} B, {} link files, partitions {eid_parts}/{person_parts}",
-        event_maps.len(),
-        link_maps.len()
+        "threads {threads}, simd {simd}, events {event_bytes} B in {} files, clicks {click_bytes} B, {} link files, partitions {eid_parts}/{person_parts}",
+        event_input.files.len(),
+        link_input.files.len()
     ));
 
     let cx = Context {
@@ -139,20 +83,19 @@ fn main() {
     };
 
     // Phase 1a: links.
-    let link_chunks = chunks(&link_maps, chunk_size);
+    let link_chunks = link_input.chunks(chunk_size);
     let next = AtomicUsize::new(0);
     let link_pairs: Vec<Vec<(u64, u64)>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
-                let (link_chunks, link_maps, next) = (&link_chunks, &link_maps, &next);
+                let (link_chunks, link_input, next) = (&link_chunks, &link_input, &next);
                 s.spawn(move || {
                     let mut out = Vec::new();
+                    let mut buf = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(c) = link_chunks.get(i) else { break };
-                        csv::for_each_line(&link_maps[c.file], c.first, c.start, c.end, |line| {
-                            events::link_line(line, &mut out)
-                        });
+                        link_input.parse::<2, _>(c, &mut buf, simd, &mut |f| events::link_fields(f, &mut out));
                     }
                     out
                 })
@@ -163,8 +106,8 @@ fn main() {
     log(&format!("links parsed: {} pairs", link_pairs.iter().map(Vec::len).sum::<usize>()));
 
     // Phase 1b: names on thread 0, events and clicks everywhere.
-    let event_chunks = chunks(&event_maps, chunk_size);
-    let click_chunks = chunks(&click_maps, chunk_size);
+    let event_chunks = event_input.chunks(chunk_size);
+    let click_chunks = click_input.chunks(chunk_size);
     let total_chunks = event_chunks.len() + click_chunks.len();
     let reserve = est_copies / (threads * eid_parts) * 5 / 4 + 16;
     let est_clicks = click_bytes / 40 + 1;
@@ -176,28 +119,25 @@ fn main() {
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
-                let (event_chunks, click_chunks, event_maps, click_maps, next, cx, link_pairs) =
-                    (&event_chunks, &click_chunks, &event_maps, &click_maps, &next, &cx, &link_pairs);
+                let (event_chunks, click_chunks, event_input, click_input, next, cx, link_pairs) =
+                    (&event_chunks, &click_chunks, &event_input, &click_input, &next, &cx, &link_pairs);
                 s.spawn(move || {
                     let names = (t == 0).then(|| links::build(link_pairs));
                     let mut parts: Scatter<EventCopy> = Scatter::new(eid_parts, reserve);
                     let mut clicks: Scatter<Click> = Scatter::new(1, click_reserve);
+                    let mut buf = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= total_chunks {
                             break;
                         }
                         if i < event_chunks.len() {
-                            let c = &event_chunks[i];
-                            arena::populate(&event_maps[c.file][c.start..c.end]);
-                            csv::for_each_line(&event_maps[c.file], c.first, c.start, c.end, |line| {
-                                events::event_line(line, cx, &mut parts)
+                            event_input.parse::<7, _>(&event_chunks[i], &mut buf, simd, &mut |f| {
+                                events::event_fields(f, cx, &mut parts)
                             });
                         } else {
-                            let c = &click_chunks[i - event_chunks.len()];
-                            arena::populate(&click_maps[c.file][c.start..c.end]);
-                            csv::for_each_line(&click_maps[c.file], c.first, c.start, c.end, |line| {
-                                events::click_line(line, cx, &mut clicks)
+                            click_input.parse::<4, _>(&click_chunks[i - event_chunks.len()], &mut buf, simd, &mut |f| {
+                                events::click_fields(f, cx, &mut clicks)
                             });
                         }
                     }

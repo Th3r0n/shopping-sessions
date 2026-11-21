@@ -1,7 +1,6 @@
 //! Event and click lines to records.
 
 use crate::arena::Scatter;
-use crate::csv;
 use crate::hash::{bucket, mix};
 use crate::key;
 use crate::lookups::{Campaigns, Products};
@@ -59,12 +58,8 @@ fn price(b: &[u8]) -> Option<u32> {
 }
 
 #[inline]
-pub fn event_line(line: &[u8], cx: &Context, parts: &mut Scatter<EventCopy>) {
-    let mut f = [&b""[..]; 7];
-    if !csv::fields::<7>(line, &mut f) {
-        return;
-    }
-    let [event_id, user, ts, ingest, event_type, product, price_cents] = f;
+pub fn event_fields(f: &[&[u8]; 7], cx: &Context, parts: &mut Scatter<EventCopy>) {
+    let [event_id, user, ts, ingest, event_type, product, price_cents] = *f;
     if event_id.is_empty() {
         return;
     }
@@ -109,12 +104,8 @@ pub fn event_line(line: &[u8], cx: &Context, parts: &mut Scatter<EventCopy>) {
 }
 
 #[inline]
-pub fn click_line(line: &[u8], cx: &Context, out: &mut Scatter<Click>) {
-    let mut f = [&b""[..]; 4];
-    if !csv::fields::<4>(line, &mut f) {
-        return;
-    }
-    let [click_id, user, campaign, ts] = f;
+pub fn click_fields(f: &[&[u8]; 4], cx: &Context, out: &mut Scatter<Click>) {
+    let [click_id, user, campaign, ts] = *f;
     if click_id.is_empty() || user.is_empty() {
         return;
     }
@@ -137,12 +128,8 @@ pub fn click_line(line: &[u8], cx: &Context, out: &mut Scatter<Click>) {
 }
 
 #[inline]
-pub fn link_line(line: &[u8], out: &mut Vec<(u64, u64)>) {
-    let mut f = [&b""[..]; 2];
-    if !csv::fields::<2>(line, &mut f) {
-        return;
-    }
-    let [a, b] = f;
+pub fn link_fields(f: &[&[u8]; 2], out: &mut Vec<(u64, u64)>) {
+    let [a, b] = *f;
     if a.is_empty() || b.is_empty() {
         return;
     }
