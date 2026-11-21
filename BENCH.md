@@ -152,3 +152,9 @@ that old range hits whatever was mapped there since: under SDE at NCPU=3 every r
 at NCPU=8 a p20 run hung once. Releasing only the arrays and the heap: 3/3 fine at NCPU=3. Our version makes
 "2" the default and releases the input range only while it is still mapped (out::REGION_UNMAPPED).
 | P10 ab-env | f25f301 | V0 XL_ENDREL=auto (old default), V1 new default (guarded release), V2 + XL_COREFIRST=1, V3 + XL_RGREL=0 | 8.09 s | k = 0: none beats the old default; fixed cost ~0.09 s. So the P9 gain came from releasing the stale input range |
+| P11 ab-env | 20870b0 | V0 and V1 XL_ENDREL=auto (A/A control), V2 XL_RELSTALE=1 (P9's V1), V3 guarded XL_ENDREL=2 | 10.61 s | k = 1, the A/A control, by ~0.2 ms: noise. P9's 25 ms did not reproduce; no release variant beats the default |
+
+So on the scorer, Team 67's defaults stay the fastest of everything tried: PGO (P8), the end-of-run release
+in both forms (P9 to P11), core-first pinning and keeping the input mapped until exit (P10). The end-of-run
+release is back to the default heuristic; the fix for the stale input range and the knobs stay. 413099b
+(release on by default) scored 0.31 s on the board, like the plain fork.

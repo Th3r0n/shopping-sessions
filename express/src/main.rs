@@ -446,15 +446,10 @@ fn main() {
     }
     #[cfg(feature = "tl")]
     let rel0 = sys::tl::now();
-    // Default "2": every thread releases its share of the big arrays and of the allocator
-    // heap before exit, instead of the kernel tearing it all down on one core at exit.
-    // Scorer A/B (BENCH.md, P9): about 25 ms faster per run than the old default (unset).
-    // XL_ENDREL=auto restores the old heuristic, 0 or 1 its other settings.
-    let endrel = match std::env::var("XL_ENDREL") {
-        Ok(v) if v == "auto" => None,
-        Ok(v) => Some(v),
-        Err(_) => Some("2".to_string()),
-    };
+    // XL_ENDREL=2 makes every thread release its share of the big arrays and of the
+    // allocator heap before exit. Scorer A/B probes (BENCH.md, P9 to P11): no gain over the
+    // default heuristic (unset or "auto"), which stays the default.
+    let endrel = std::env::var("XL_ENDREL").ok().filter(|v| v != "auto");
     let many_faults = endrel.is_none() && sys::minflt(0) as usize > 2 * (g.files.last().map_or(0, |f| f.off + f.len) >> 16) + 60_000;
     if ((sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) || many_faults) && endrel.as_deref().map_or(true, |v| v == "1")) || endrel.as_deref() == Some("2") {
         let nt = g.nt;
