@@ -15,7 +15,21 @@ struct Region<T> {
 #[cfg(target_os = "linux")]
 const HUGE: usize = 2 << 20;
 
-static PREFAULT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("SS_PREFAULT").as_deref() == Ok("1"));
+static PREFAULT_SET: std::sync::Once = std::sync::Once::new();
+static PREFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether arenas are prefaulted 2 MiB at a time (SS_PREFAULT=1, or `set_prefault`).
+#[inline]
+fn prefault_on() -> bool {
+    PREFAULT_SET.call_once(|| PREFAULT.store(std::env::var("SS_PREFAULT").as_deref() == Ok("1"), std::sync::atomic::Ordering::Relaxed));
+    PREFAULT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Probe only: turns prefaulting on or off for the arenas carved from now on.
+pub fn set_prefault(on: bool) {
+    let _ = prefault_on();
+    PREFAULT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// With SS_PREFAULT=1: when `offset..offset + len` (bytes from a 2 MiB-aligned region
 /// start) enters a new 2 MiB step, maps that whole step in one call
@@ -23,7 +37,7 @@ static PREFAULT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::en
 #[inline]
 fn prefault_step(base: *mut u8, offset: usize, len: usize, region_bytes: usize) {
     #[cfg(target_os = "linux")]
-    if *PREFAULT && offset % HUGE == 0 || *PREFAULT && (offset + len - 1) / HUGE != offset / HUGE {
+    if (offset % HUGE == 0 || (offset + len - 1) / HUGE != offset / HUGE) && prefault_on() {
         let step = (offset + len - 1) / HUGE * HUGE;
         let n = HUGE.min(region_bytes.saturating_sub(step));
         if n > 0 {

@@ -15,6 +15,8 @@
 //!         twice each, before the real run; sleep 9 + 30 x (best A - best B) seconds
 //!   ab-thp  the events parse with arenas advised for huge pages (A) and against them
 //!         (B), twice each, before the real run; sleep 9 + 30 x (best A - best B)
+//!   ab-prefault  the events parse with arenas faulted page by page (A) and 2 MiB at a
+//!         time with MADV_POPULATE_WRITE (B); sleep 9 + 30 x (best A - best B)
 //!   cpu   sleep 1 s if avx512f, + 2 s if avx512bw, + 4 s if avx512vbmi2, + 8 s if AMD
 //!   phase:NAME  sleep 20 x the duration of phase NAME (links, names, parse, dedup,
 //!         resolve, sessions, written: each from the previous mark to its own)
@@ -165,7 +167,7 @@ pub fn finish(mode: &str, started: Instant, cold_secs: f64, ncpu: usize) {
             }
             d
         }
-        "ab-io" | "ab-scatter" | "ab-thp" => {
+        "ab-io" | "ab-scatter" | "ab-thp" | "ab-prefault" => {
             let (a, b) = *AB.lock().unwrap();
             if crate::stats::enabled() {
                 eprintln!("probe {mode}: A {a:.4}s, B {b:.4}s");

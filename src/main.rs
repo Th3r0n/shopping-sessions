@@ -261,6 +261,18 @@ fn main() {
         std::env::remove_var("SS_THP");
         probe::set_ab(a, b);
     }
+    if probe_mode.as_deref() == Some("ab-prefault") {
+        // the same parse with arenas faulted page by page (A) and 2 MiB at a time (B)
+        let (mut a, mut b) = (f64::MAX, f64::MAX);
+        for _ in 0..2 {
+            arena::set_prefault(false);
+            a = a.min(parse_round(&event_input, &event_chunks, false));
+            arena::set_prefault(true);
+            b = b.min(parse_round(&event_input, &event_chunks, false));
+        }
+        arena::set_prefault(false);
+        probe::set_ab(a, b);
+    }
     if probe_mode.as_deref() == Some("ab-scatter") {
         // the same parse storing its copies (A) and only decoding them (B), alternated
         let (mut a, mut b) = (f64::MAX, f64::MAX);
