@@ -154,19 +154,23 @@ fn civil_ms(b: &[u8; 19]) -> Option<i64> {
     if bad {
         return None;
     }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days_in_month = DAYS_IN_MONTH[(month - 1) as usize] as u32 + (month == 2 && leap) as u32;
-    if day > days_in_month {
-        return None;
-    }
-    let (year, month, day) = (year as i64, month as i64, day as i64);
-    let index = (year - TABLE_FIRST_YEAR) * 12 + month - 1;
-    let days = if (0..(TABLE_YEARS * 12) as i64).contains(&index) {
-        MONTH_START[index as usize] as i64 + day - 1
+    let index = (year as i64 - TABLE_FIRST_YEAR) * 12 + month as i64 - 1;
+    let days = if (0..(TABLE_YEARS * 12 - 1) as i64).contains(&index) {
+        // the month's length is the gap to the next month's start: no leap-year arithmetic
+        let (first, next) = (MONTH_START[index as usize], MONTH_START[index as usize + 1]);
+        if day as i32 > next - first {
+            return None;
+        }
+        first as i64 + day as i64 - 1
     } else {
-        days_from_civil(year, month, day)
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days_in_month = DAYS_IN_MONTH[(month - 1) as usize] as u32 + (month == 2 && leap) as u32;
+        if day > days_in_month {
+            return None;
+        }
+        days_from_civil(year as i64, month as i64, day as i64)
     };
-    Some(((days * 24 + hour as i64) * 60 + minute as i64) * 60_000 + second as i64 * SECOND)
+    Some(days * 86_400_000 + hour as i64 * 3_600_000 + minute as i64 * 60_000 + second as i64 * SECOND)
 }
 
 /// `ingest_ts`, which rules.md guarantees is a valid F1: checked only for its

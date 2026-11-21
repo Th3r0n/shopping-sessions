@@ -160,9 +160,17 @@ pub fn event_fields(f: &[&[u8]; 7], cx: &Context, parts: &mut Copies) {
         if user.is_empty() || product.is_empty() {
             break 'valid;
         }
-        let purchase = match event_type {
-            b"view" | b"cart" => false,
-            b"purchase" => true,
+        // view and cart are compared as words, without a branch between them
+        let purchase = match *event_type {
+            [a, b, c, d] => {
+                let w = u32::from_le_bytes([a, b, c, d]);
+                if (w == u32::from_le_bytes(*b"view")) | (w == u32::from_le_bytes(*b"cart")) {
+                    false
+                } else {
+                    break 'valid;
+                }
+            }
+            [a, b, c, d, e, f, g, h] if u64::from_le_bytes([a, b, c, d, e, f, g, h]) == u64::from_le_bytes(*b"purchase") => true,
             _ => break 'valid,
         };
         let user_key = key::key(user);
