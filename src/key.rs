@@ -58,6 +58,17 @@ pub fn pack(bytes: &[u8]) -> Option<u64> {
     if n == 0 || n > MAX_PACKED {
         return None;
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", target_feature = "sse4.1"))]
+    if (bytes.as_ptr() as usize & 4095) <= 4096 - 16 {
+        // SAFETY: the 16 bytes read stay inside the page of bytes[0], which is mapped.
+        return unsafe { pack_simd(bytes.as_ptr(), n) };
+    }
+    pack_scalar(bytes)
+}
+
+#[inline]
+fn pack_scalar(bytes: &[u8]) -> Option<u64> {
+    let n = bytes.len();
     let mut acc: u64 = 0;
     for &b in bytes {
         let c = CODE[b as usize];
@@ -67,6 +78,37 @@ pub fn pack(bytes: &[u8]) -> Option<u64> {
         acc = (acc << 6) | c as u64;
     }
     Some(acc << (6 * (MAX_PACKED - n)))
+}
+
+/// pack() on 16 bytes at once: codes by range (SSE), then the 6-bit fields
+/// gathered with pext, first byte highest. Only the first n bytes count.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn pack_simd(ptr: *const u8, n: usize) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let c = _mm_loadu_si128(ptr as *const __m128i);
+    let in_range = |lo: i8, hi: i8| _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(lo - 1)), _mm_cmplt_epi8(c, _mm_set1_epi8(hi + 1)));
+    let digit = in_range(b'0' as i8, b'9' as i8);
+    let upper = in_range(b'A' as i8, b'Z' as i8);
+    let under = _mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8));
+    let lower = in_range(b'a' as i8, b'z' as i8);
+    // code = byte - offset: '0'..'9' -> 1..10, 'A'..'Z' -> 11..36, '_' -> 37, 'a'..'z' -> 38..63
+    let offset = _mm_or_si128(
+        _mm_or_si128(_mm_and_si128(digit, _mm_set1_epi8(0x2f)), _mm_and_si128(upper, _mm_set1_epi8(0x36))),
+        _mm_or_si128(_mm_and_si128(under, _mm_set1_epi8(0x3a)), _mm_and_si128(lower, _mm_set1_epi8(0x3b))),
+    );
+    let valid = _mm_or_si128(_mm_or_si128(digit, upper), _mm_or_si128(under, lower));
+    let iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let inside = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), iota);
+    if _mm_movemask_epi8(_mm_andnot_si128(valid, inside)) != 0 {
+        return None;
+    }
+    let codes = _mm_and_si128(_mm_sub_epi8(c, offset), inside);
+    let lo = _mm_cvtsi128_si64(codes) as u64; // bytes 0-7
+    let hi = _mm_extract_epi64::<1>(codes) as u64; // bytes 8-15 (only 8 and 9 can be set)
+    let head = _pext_u64(lo.swap_bytes(), 0x3f3f_3f3f_3f3f_3f3f);
+    let tail = _pext_u64(((hi & 0xff) << 8) | ((hi >> 8) & 0xff), 0x3f3f);
+    Some((head << 12) | tail)
 }
 
 struct Interner {
@@ -182,6 +224,29 @@ mod tests {
                 assert_eq!(cmp(keys[i], keys[j]), ids[i].cmp(&ids[j]), "{:?} {:?}", ids[i], ids[j]);
                 assert_eq!(keys[i] == keys[j], ids[i] == ids[j]);
             }
+        }
+    }
+
+    #[test]
+    fn simd_pack_matches_scalar() {
+        // A buffer whose IDs start everywhere, including the last bytes of pages.
+        let mut s = 0x0123_4567_89ab_cdefu64;
+        let alphabet: &[u8] = &[b'0', b'9', b'A', b'Z', b'_', b'a', b'z', b'1', b'9', b'b', b'q', 0x00, 0x7f, 0x80, 0xff, b'/', b':', b'@', b'[', b'`', b'{', b' ', b'-'];
+        let mut buf = vec![0u8; 3 * 4096];
+        for b in buf.iter_mut() {
+            *b = alphabet[(rng(&mut s) % alphabet.len() as u64) as usize];
+        }
+        for _ in 0..200_000 {
+            let start = (rng(&mut s) % (buf.len() as u64 - 16)) as usize;
+            let len = (rng(&mut s) % 13) as usize;
+            if rng(&mut s) % 2 == 0 {
+                for b in &mut buf[start..start + len] {
+                    *b = b"0123456789ABCXYZ_abcxyz"[(rng(&mut s) % 23) as usize];
+                }
+            }
+            let id = &buf[start..start + len];
+            let reference = if id.is_empty() || id.len() > MAX_PACKED { None } else { pack_scalar(id) };
+            assert_eq!(pack(id), reference, "{:?}", id);
         }
     }
 
