@@ -109,9 +109,12 @@ fn main() {
     let event_chunks = event_input.chunks(chunk_size);
     let click_chunks = click_input.chunks(chunk_size);
     let total_chunks = event_chunks.len() + click_chunks.len();
-    let reserve = est_copies / (threads * eid_parts) * 5 / 4 + 16;
-    let est_clicks = click_bytes / 40 + 1;
-    let person_click_reserve = est_clicks / (threads * person_parts) * 5 / 4 + 16;
+    // Arena room per thread: thread 0 spends a while on the names, so the others
+    // each parse about 1/(threads-1) of the data. Untouched room costs nothing.
+    let busy = threads.saturating_sub(1).max(1);
+    let est_clicks = click_bytes / 45 + 1;
+    let event_room = est_copies * 13 / 10 / busy;
+    let click_room = est_clicks * 13 / 10 / busy;
     let next = AtomicUsize::new(0);
     let names_cell: std::sync::OnceLock<links::Names> = std::sync::OnceLock::new();
     let mut event_parts: Vec<Scatter<EventCopy>> = Vec::with_capacity(threads);
@@ -127,8 +130,8 @@ fn main() {
                         let _ = names_cell.set(links::build(link_pairs));
                         eprintln!("           names built in {:.3}s on thread 0", started.elapsed().as_secs_f64());
                     }
-                    let mut parts: Scatter<EventCopy> = Scatter::new(eid_parts, reserve);
-                    let mut clicks: Scatter<PersonClick> = Scatter::new(person_parts, person_click_reserve);
+                    let mut parts: Scatter<EventCopy> = Scatter::new(eid_parts, est_copies / threads, event_room);
+                    let mut clicks: Scatter<PersonClick> = Scatter::new(person_parts, est_clicks / threads, click_room);
                     let mut buf = Vec::new();
                     let mut pending_events = events::Pending::new();
                     let mut pending_clicks = events::Pending::new();
@@ -173,7 +176,7 @@ fn main() {
     ));
 
     // Phase 2: dedup and route to person partitions.
-    let person_reserve = est_copies / (threads * person_parts) * 5 / 4 + 16;
+    let person_room = est_copies * 13 / 10 / threads;
     let next = AtomicUsize::new(0);
     let person_events: Vec<Scatter<PersonEvent>> =
         std::thread::scope(|s| {
@@ -181,7 +184,7 @@ fn main() {
                 .map(|_| {
                     let (event_parts, next) = (&event_parts, &next);
                     s.spawn(move || {
-                        let mut evs: Scatter<PersonEvent> = Scatter::new(person_parts, person_reserve);
+                        let mut evs: Scatter<PersonEvent> = Scatter::new(person_parts, est_copies / threads, person_room);
                         let mut table = Vec::new();
                         let mut kept = Vec::new();
                         let mut slices: Vec<&[EventCopy]> = Vec::with_capacity(2 * event_parts.len());

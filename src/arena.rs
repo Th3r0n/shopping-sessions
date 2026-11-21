@@ -64,10 +64,18 @@ pub fn zeroed_slice<T: Copy>(n: usize) -> &'static mut [T] {
     unsafe { std::slice::from_raw_parts_mut(ptr, n) }
 }
 
+/// Values scattered into partitions, stored in blocks carved in order from one
+/// per-thread arena: the memory touched (and zeroed by the kernel) is the data
+/// actually written, not a reserved capacity per partition.
 pub struct Scatter<T: Copy> {
     region: Region<T>,
-    cap: usize,
-    lens: Vec<u32>,
+    capacity: usize,
+    used: usize,
+    block: usize,
+    /// Per partition: its blocks (as block numbers), and how full the last one is.
+    blocks: Vec<Vec<u32>>,
+    current: Vec<usize>,
+    fill: Vec<usize>,
     overflow: Vec<Vec<T>>,
     _marker: PhantomData<T>,
 }
@@ -77,44 +85,75 @@ unsafe impl<T: Copy + Send> Send for Scatter<T> {}
 unsafe impl<T: Copy + Sync> Sync for Scatter<T> {}
 
 impl<T: Copy> Scatter<T> {
-    /// `parts` partitions of `cap` values each before spilling.
-    pub fn new(parts: usize, cap: usize) -> Self {
-        let cap = cap.max(1);
+    /// `parts` partitions, about `expected` values in all (an estimate), room for
+    /// `capacity` values in the arena before spilling into Vecs.
+    pub fn new(parts: usize, expected: usize, capacity: usize) -> Self {
+        let block = (expected / parts.max(1) / 8).clamp(16, 1024);
+        let capacity = capacity + parts * block;
         Self {
-            region: Region::new(parts * cap),
-            cap,
-            lens: vec![0; parts],
+            region: Region::new(capacity),
+            capacity,
+            used: 0,
+            block,
+            blocks: (0..parts).map(|_| Vec::new()).collect(),
+            current: vec![0; parts],
+            fill: vec![block; parts],
             overflow: (0..parts).map(|_| Vec::new()).collect(),
             _marker: PhantomData,
         }
     }
 
     pub fn parts(&self) -> usize {
-        self.lens.len()
+        self.blocks.len()
     }
 
     #[inline]
     pub fn push(&mut self, p: usize, value: T) {
-        let len = self.lens[p] as usize;
-        if len < self.cap {
-            // SAFETY: p * cap + len is inside the region (len < cap, p < parts).
-            unsafe { self.region.ptr.add(p * self.cap + len).write(value) };
-            self.lens[p] += 1;
+        let f = self.fill[p];
+        if f < self.block {
+            // SAFETY: current[p] + f lies inside a block of the region.
+            unsafe { self.region.ptr.add(self.current[p] + f).write(value) };
+            self.fill[p] = f + 1;
+        } else {
+            self.push_new_block(p, value);
+        }
+    }
+
+    #[cold]
+    fn push_new_block(&mut self, p: usize, value: T) {
+        if self.used + self.block <= self.capacity {
+            let start = self.used;
+            self.used += self.block;
+            self.blocks[p].push((start / self.block) as u32);
+            self.current[p] = start;
+            // SAFETY: start is the beginning of a fresh block inside the region.
+            unsafe { self.region.ptr.add(start).write(value) };
+            self.fill[p] = 1;
         } else {
             self.overflow[p].push(value);
         }
     }
 
-    /// The values of partition p, as the region part and the spilled part.
+    /// The values of partition p, as slices.
     #[inline]
-    pub fn part(&self, p: usize) -> [&[T]; 2] {
-        // SAFETY: the first lens[p] values of the region part were written by push.
-        let main = unsafe { std::slice::from_raw_parts(self.region.ptr.add(p * self.cap), self.lens[p] as usize) };
-        [main, self.overflow[p].as_slice()]
+    pub fn part(&self, p: usize) -> impl Iterator<Item = &[T]> + '_ {
+        let blocks = &self.blocks[p];
+        let last = blocks.len().wrapping_sub(1);
+        blocks
+            .iter()
+            .enumerate()
+            .map(move |(i, &b)| {
+                let len = if i == last { self.fill[p] } else { self.block };
+                // SAFETY: the first len values of the block were written by push.
+                unsafe { std::slice::from_raw_parts(self.region.ptr.add(b as usize * self.block), len) }
+            })
+            .chain(std::iter::once(self.overflow[p].as_slice()))
     }
 
     pub fn len(&self, p: usize) -> usize {
-        self.lens[p] as usize + self.overflow[p].len()
+        let n = self.blocks[p].len();
+        let in_blocks = if n == 0 { 0 } else { (n - 1) * self.block + self.fill[p] };
+        in_blocks + self.overflow[p].len()
     }
 
     pub fn total(&self) -> usize {
@@ -127,16 +166,18 @@ mod tests {
     use super::Scatter;
 
     #[test]
-    fn spills_and_keeps_order() {
-        let mut s: Scatter<u64> = Scatter::new(3, 4);
-        for i in 0..30u64 {
-            s.push((i % 3) as usize, i);
+    fn blocks_spill_and_keep_order() {
+        for capacity in [0, 5, 40, 1000] {
+            let mut s: Scatter<u64> = Scatter::new(3, 48, capacity);
+            for i in 0..3000u64 {
+                s.push((i % 3) as usize, i);
+            }
+            for p in 0..3 {
+                let all: Vec<u64> = s.part(p).flatten().copied().collect();
+                assert_eq!(all, (0..3000).filter(|i| i % 3 == p as u64).collect::<Vec<_>>());
+                assert_eq!(s.len(p), 1000);
+            }
+            assert_eq!(s.total(), 3000);
         }
-        for p in 0..3 {
-            let [a, b] = s.part(p);
-            let all: Vec<u64> = a.iter().chain(b).copied().collect();
-            assert_eq!(all, (0..30).filter(|i| i % 3 == p as u64).collect::<Vec<_>>());
-        }
-        assert_eq!(s.total(), 30);
     }
 }
