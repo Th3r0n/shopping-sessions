@@ -1,7 +1,5 @@
 //! Hashing of 64-bit keys and a small open-addressing map.
 
-use std::hash::{BuildHasherDefault, Hasher};
-
 #[inline]
 pub fn mix(mut x: u64) -> u64 {
     x ^= x >> 33;
@@ -17,24 +15,3 @@ pub fn mix(mut x: u64) -> u64 {
 pub fn bucket(hash: u64, n: usize) -> usize {
     (((hash >> 32) * n as u64) >> 32) as usize
 }
-
-/// A fast hasher for std maps keyed by u64.
-#[derive(Default)]
-pub struct MixHasher(u64);
-
-impl Hasher for MixHasher {
-    fn finish(&self) -> u64 {
-        mix(self.0)
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.rotate_left(8) ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        }
-    }
-    fn write_u64(&mut self, n: u64) {
-        self.0 ^= n;
-    }
-}
-
-pub type MixBuild = BuildHasherDefault<MixHasher>;
-pub type FastMap<K, V> = std::collections::HashMap<K, V, MixBuild>;

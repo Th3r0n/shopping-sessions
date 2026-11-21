@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::csv;
-use crate::hash::FastMap;
+use crate::hash::mix;
 use crate::key;
 use crate::ts;
 
@@ -42,25 +42,55 @@ fn small_rows<const N: usize>(path: &Path, mut f: impl FnMut([&[u8]; N])) {
     });
 }
 
-/// An exact map from ID bytes to a small index.
+/// An exact map from ID bytes to a small index: packable IDs in a small
+/// open-addressing table of (key, value + 1) slots, the rest in a HashMap.
 pub struct IdMap {
-    packed: FastMap<u64, u32>,
+    slots: Vec<[u64; 2]>,
+    mask: usize,
+    len: usize,
     other: std::collections::HashMap<Vec<u8>, u32>,
 }
 
 impl IdMap {
     fn new() -> Self {
         Self {
-            packed: FastMap::default(),
+            slots: vec![[0, 0]; 16],
+            mask: 15,
+            len: 0,
             other: std::collections::HashMap::new(),
+        }
+    }
+
+    fn insert_packed(&mut self, k: u64, value: u32) {
+        if (self.len + 1) * 2 > self.slots.len() {
+            let bigger = vec![[0, 0]; self.slots.len() * 2];
+            let old = std::mem::replace(&mut self.slots, bigger);
+            self.mask = self.slots.len() - 1;
+            self.len = 0;
+            for [key, v] in old {
+                if key != 0 {
+                    self.insert_packed(key, (v - 1) as u32);
+                }
+            }
+        }
+        let mut i = mix(k) as usize & self.mask;
+        loop {
+            if self.slots[i][0] == 0 {
+                self.slots[i] = [k, value as u64 + 1];
+                self.len += 1;
+                return;
+            }
+            if self.slots[i][0] == k {
+                self.slots[i][1] = value as u64 + 1;
+                return;
+            }
+            i = (i + 1) & self.mask;
         }
     }
 
     fn insert(&mut self, id: &[u8], value: u32) {
         match key::pack(id) {
-            Some(k) => {
-                self.packed.insert(k, value);
-            }
+            Some(k) => self.insert_packed(k, value),
             None => {
                 self.other.insert(id.to_vec(), value);
             }
@@ -70,7 +100,19 @@ impl IdMap {
     #[inline]
     pub fn get(&self, id: &[u8]) -> Option<u32> {
         match key::pack(id) {
-            Some(k) => self.packed.get(&k).copied(),
+            Some(k) => {
+                let mut i = mix(k) as usize & self.mask;
+                loop {
+                    let [key, v] = self.slots[i];
+                    if key == k {
+                        return Some((v - 1) as u32);
+                    }
+                    if key == 0 {
+                        return None;
+                    }
+                    i = (i + 1) & self.mask;
+                }
+            }
             None => self.other.get(id).copied(),
         }
     }

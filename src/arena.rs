@@ -141,7 +141,7 @@ impl<T: Copy> Scatter<T> {
 
     /// Like push, through the partition's staging line (T must divide 64 bytes).
     /// `finish` must run before the values are read.
-    #[inline]
+    #[inline(always)]
     pub fn push_wc(&mut self, p: usize, value: T) {
         debug_assert!(self.per_line > 0);
         let n = self.staged[p] as usize;
@@ -155,7 +155,7 @@ impl<T: Copy> Scatter<T> {
         }
     }
 
-    #[inline]
+    #[inline(never)]
     fn flush_line(&mut self, p: usize) {
         if self.fill[p] == self.block {
             if self.used + self.block > self.capacity {
