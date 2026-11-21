@@ -11,7 +11,7 @@ import statistics
 
 from bench import run
 
-PHASE = re.compile(r"\+\s*([0-9.]+)s .*\] (events parsed|deduplicated|sessionized|written)")
+PHASE = re.compile(r"\+\s*([0-9.]+)s .*\] (links parsed|events parsed|deduplicated|names resolved|sessionized|written)")
 
 
 def phases(log):
@@ -28,6 +28,7 @@ def main():
     ap.add_argument("--mem", default="14g")
     ap.add_argument("--cpuset", default="0-7")
     ap.add_argument("--env", nargs="*", default=[])
+    ap.add_argument("--output", choices=["volume", "tmpfs"], default="tmpfs")
     args = ap.parse_args()
     walls = {args.a: [], args.b: []}
     logs = {args.a: [], args.b: []}

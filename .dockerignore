@@ -7,3 +7,4 @@ out/
 *.md
 .git
 generic/target/
+proto/

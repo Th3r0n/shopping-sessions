@@ -1,0 +1,14 @@
+# Timing prototype of the v2 front-end (see the plan in BENCH.md). Not part of the image.
+[package]
+name = "frontend-proto"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
