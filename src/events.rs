@@ -1,5 +1,6 @@
 //! Event and click lines to records.
 
+use crate::arena::Scatter;
 use crate::csv;
 use crate::hash::{bucket, mix};
 use crate::key;
@@ -58,7 +59,7 @@ fn price(b: &[u8]) -> Option<u32> {
 }
 
 #[inline]
-pub fn event_line(line: &[u8], cx: &Context, parts: &mut [Vec<EventCopy>]) {
+pub fn event_line(line: &[u8], cx: &Context, parts: &mut Scatter<EventCopy>) {
     let mut f = [&b""[..]; 7];
     if !csv::fields::<7>(line, &mut f) {
         return;
@@ -103,12 +104,12 @@ pub fn event_line(line: &[u8], cx: &Context, parts: &mut [Vec<EventCopy>]) {
         copy.ts = t;
         copy.flags = SURVIVES | if purchase { PURCHASE } else { 0 };
     }
-    let p = bucket(mix(copy.event_id), parts.len());
-    parts[p].push(copy);
+    let p = bucket(mix(copy.event_id), parts.parts());
+    parts.push(p, copy);
 }
 
 #[inline]
-pub fn click_line(line: &[u8], cx: &Context, out: &mut Vec<Click>) {
+pub fn click_line(line: &[u8], cx: &Context, out: &mut Scatter<Click>) {
     let mut f = [&b""[..]; 4];
     if !csv::fields::<4>(line, &mut f) {
         return;
@@ -124,12 +125,15 @@ pub fn click_line(line: &[u8], cx: &Context, out: &mut Vec<Click>) {
     let Some(campaign) = cx.campaigns.get(campaign) else {
         return;
     };
-    out.push(Click {
-        user: key::key(user),
-        click_id: key::key(click_id),
-        ts: t,
-        campaign,
-    });
+    out.push(
+        0,
+        Click {
+            user: key::key(user),
+            click_id: key::key(click_id),
+            ts: t,
+            campaign,
+        },
+    );
 }
 
 #[inline]

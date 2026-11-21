@@ -8,6 +8,7 @@
 //!   3. per person partition: sessions, credit, assists, daily aggregates
 //!   4. Parquet
 
+mod arena;
 mod csv;
 mod events;
 mod hash;
@@ -16,13 +17,14 @@ mod links;
 mod lookups;
 mod output;
 mod sessions;
+mod stats;
 mod ts;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
+use arena::Scatter;
 use memmap2::Mmap;
 use parquet::data_type::ByteArray;
 
@@ -92,8 +94,11 @@ fn env_usize(name: &str) -> Option<usize> {
 }
 
 fn main() {
-    let clock = Instant::now();
-    let log = |what: &str| eprintln!("[{:>8.3}s] {what}", clock.elapsed().as_secs_f64());
+    if std::env::var_os("SS_NOOP").is_some() {
+        std::process::exit(0); // measures the fixed cost of starting and stopping the container
+    }
+    let mut stats = stats::Stats::new();
+    let mut log = |what: &str| stats.log(what);
     let args: Vec<String> = std::env::args().collect();
     let (data, out) = if args.len() >= 3 {
         (PathBuf::from(&args[1]), PathBuf::from(&args[2]))
@@ -161,11 +166,13 @@ fn main() {
     let event_chunks = chunks(&event_maps, chunk_size);
     let click_chunks = chunks(&click_maps, chunk_size);
     let total_chunks = event_chunks.len() + click_chunks.len();
-    let reserve = est_copies / (threads * eid_parts) * 5 / 4 + 4;
+    let reserve = est_copies / (threads * eid_parts) * 5 / 4 + 16;
+    let est_clicks = click_bytes / 40 + 1;
+    let click_reserve = est_clicks / threads * 5 / 4 + 16;
     let next = AtomicUsize::new(0);
     let mut names = None;
-    let mut event_parts: Vec<Vec<Vec<EventCopy>>> = Vec::with_capacity(threads);
-    let mut click_bufs: Vec<Vec<Click>> = Vec::with_capacity(threads);
+    let mut event_parts: Vec<Scatter<EventCopy>> = Vec::with_capacity(threads);
+    let mut click_bufs: Vec<Scatter<Click>> = Vec::with_capacity(threads);
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -173,8 +180,8 @@ fn main() {
                     (&event_chunks, &click_chunks, &event_maps, &click_maps, &next, &cx, &link_pairs);
                 s.spawn(move || {
                     let names = (t == 0).then(|| links::build(link_pairs));
-                    let mut parts: Vec<Vec<EventCopy>> = (0..eid_parts).map(|_| Vec::with_capacity(reserve)).collect();
-                    let mut clicks: Vec<Click> = Vec::new();
+                    let mut parts: Scatter<EventCopy> = Scatter::new(eid_parts, reserve);
+                    let mut clicks: Scatter<Click> = Scatter::new(1, click_reserve);
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= total_chunks {
@@ -182,11 +189,13 @@ fn main() {
                         }
                         if i < event_chunks.len() {
                             let c = &event_chunks[i];
+                            arena::populate(&event_maps[c.file][c.start..c.end]);
                             csv::for_each_line(&event_maps[c.file], c.first, c.start, c.end, |line| {
                                 events::event_line(line, cx, &mut parts)
                             });
                         } else {
                             let c = &click_chunks[i - event_chunks.len()];
+                            arena::populate(&click_maps[c.file][c.start..c.end]);
                             csv::for_each_line(&click_maps[c.file], c.first, c.start, c.end, |line| {
                                 events::click_line(line, cx, &mut clicks)
                             });
@@ -209,47 +218,46 @@ fn main() {
     drop(link_pairs);
     log(&format!(
         "events parsed: {} copies, {} valid clicks",
-        event_parts.iter().flatten().map(Vec::len).sum::<usize>(),
-        click_bufs.iter().map(Vec::len).sum::<usize>()
+        event_parts.iter().map(Scatter::total).sum::<usize>(),
+        click_bufs.iter().map(Scatter::total).sum::<usize>()
     ));
 
     // Phase 2: dedup and route to person partitions.
     const CLICK_SLICE: usize = 1 << 16;
-    let click_items: Vec<(usize, usize, usize)> = click_bufs
+    let click_items: Vec<&[Click]> = click_bufs
         .iter()
-        .enumerate()
-        .flat_map(|(t, b)| (0..b.len()).step_by(CLICK_SLICE).map(move |a| (t, a, (a + CLICK_SLICE).min(b.len()))))
+        .flat_map(|b| b.part(0))
+        .flat_map(|slice| slice.chunks(CLICK_SLICE))
         .collect();
-    let person_reserve = est_copies / (threads * person_parts) * 5 / 4 + 4;
+    let person_reserve = est_copies / (threads * person_parts) * 5 / 4 + 16;
+    let person_click_reserve = est_clicks / (threads * person_parts) * 5 / 4 + 16;
     let next = AtomicUsize::new(0);
     let next_click = AtomicUsize::new(0);
-    let (person_events, person_clicks): (Vec<Vec<Vec<PersonEvent>>>, Vec<Vec<Vec<PersonClick>>>) =
+    let (person_events, person_clicks): (Vec<Scatter<PersonEvent>>, Vec<Scatter<PersonClick>>) =
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
-                    let (event_parts, click_bufs, click_items, names, next, next_click) =
-                        (&event_parts, &click_bufs, &click_items, &names, &next, &next_click);
+                    let (event_parts, click_items, names, next, next_click) =
+                        (&event_parts, &click_items, &names, &next, &next_click);
                     s.spawn(move || {
-                        let mut evs: Vec<Vec<PersonEvent>> =
-                            (0..person_parts).map(|_| Vec::with_capacity(person_reserve)).collect();
-                        let mut cls: Vec<Vec<PersonClick>> = (0..person_parts).map(|_| Vec::new()).collect();
+                        let mut evs: Scatter<PersonEvent> = Scatter::new(person_parts, person_reserve);
+                        let mut cls: Scatter<PersonClick> = Scatter::new(person_parts, person_click_reserve);
                         let mut table = Vec::new();
-                        let mut slices: Vec<&[EventCopy]> = Vec::with_capacity(event_parts.len());
+                        let mut kept = Vec::new();
+                        let mut slices: Vec<&[EventCopy]> = Vec::with_capacity(2 * event_parts.len());
                         loop {
                             let p = next.fetch_add(1, Ordering::Relaxed);
                             if p >= eid_parts {
                                 break;
                             }
                             slices.clear();
-                            slices.extend(event_parts.iter().map(|t| t[p].as_slice()));
-                            sessions::dedup(&slices, names, &mut table, &mut evs);
+                            slices.extend(event_parts.iter().flat_map(|t| t.part(p)));
+                            sessions::dedup(&slices, names, &mut table, &mut kept, &mut evs);
                         }
                         loop {
                             let i = next_click.fetch_add(1, Ordering::Relaxed);
-                            let Some(&(t, a, b)) = click_items.get(i) else { break };
-                            for c in &click_bufs[t][a..b] {
-                                sessions::route_click(c, names, &mut cls);
-                            }
+                            let Some(&slice) = click_items.get(i) else { break };
+                            sessions::route_clicks(slice, names, &mut cls);
                         }
                         (evs, cls)
                     })
@@ -269,8 +277,8 @@ fn main() {
     };
     let mut order: Vec<(usize, usize)> = (0..person_parts)
         .map(|q| {
-            let n = person_events.iter().map(|t| t[q].len()).sum::<usize>()
-                + person_clicks.iter().map(|t| t[q].len()).sum::<usize>();
+            let n = person_events.iter().map(|t| t.len(q)).sum::<usize>()
+                + person_clicks.iter().map(|t| t.len(q)).sum::<usize>();
             (n, q)
         })
         .collect();
@@ -286,8 +294,8 @@ fn main() {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&(_, q)) = order.get(i) else { break };
                         acc.partition(
-                            person_events.iter().map(|t| t[q].as_slice()),
-                            person_clicks.iter().map(|t| t[q].as_slice()),
+                            person_events.iter().flat_map(|t| t.part(q)),
+                            person_clicks.iter().flat_map(|t| t.part(q)),
                         );
                     }
                     acc

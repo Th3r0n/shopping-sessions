@@ -37,21 +37,6 @@ impl U64Map {
         }
     }
 
-    #[inline]
-    pub fn get(&self, key: u64) -> Option<u32> {
-        let mut i = mix(key) as usize & self.mask;
-        loop {
-            let k = self.keys[i];
-            if k == key {
-                return Some(self.values[i]);
-            }
-            if k == 0 {
-                return None;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-
     /// The value for `key`, inserting `value` if it is absent; true if inserted.
     #[inline]
     pub fn get_or_insert(&mut self, key: u64, value: u32) -> (u32, bool) {

@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 
+use crate::arena::Scatter;
 use crate::events::{Click, EventCopy, PURCHASE, SURVIVES, WEEK};
 use crate::hash::{bucket, mix};
 use crate::key;
@@ -41,7 +42,13 @@ pub struct Slot {
 /// Keeps, per event_id, the copy with the smallest ingest_ts (copies tied on it are
 /// identical) and sends the kept copies that survive to their person's partition.
 /// `parts` holds this event_id partition's copies, one slice per parsing thread.
-pub fn dedup(parts: &[&[EventCopy]], names: &Names, table: &mut Vec<Slot>, out: &mut [Vec<PersonEvent>]) {
+pub fn dedup(
+    parts: &[&[EventCopy]],
+    names: &Names,
+    table: &mut Vec<Slot>,
+    kept: &mut Vec<PersonEvent>,
+    out: &mut Scatter<PersonEvent>,
+) {
     let n: usize = parts.iter().map(|p| p.len()).sum();
     if n == 0 {
         return;
@@ -71,34 +78,59 @@ pub fn dedup(parts: &[&[EventCopy]], names: &Names, table: &mut Vec<Slot>, out: 
             }
         }
     }
+    // The kept copies that survive, then their names: the name lookups miss the
+    // cache, so each one is prefetched LAG entries ahead.
+    kept.clear();
     for s in table.iter() {
         if s.event_id == 0 {
             continue;
         }
         let c = &parts[(s.at >> 32) as usize][(s.at & 0xffff_ffff) as usize];
-        if c.flags & SURVIVES == 0 {
-            continue;
+        if c.flags & SURVIVES != 0 {
+            kept.push(PersonEvent {
+                person: c.user,
+                ts: c.ts,
+                price: c.price,
+                category: c.category,
+                flags: c.flags,
+            });
         }
-        let person = names.get(c.user);
-        out[bucket(mix(person), out.len())].push(PersonEvent {
-            person,
-            ts: c.ts,
-            price: c.price,
-            category: c.category,
-            flags: c.flags,
-        });
+    }
+    for e in kept.iter().take(LAG) {
+        names.prefetch(e.person);
+    }
+    for i in 0..kept.len() {
+        if let Some(ahead) = kept.get(i + LAG) {
+            names.prefetch(ahead.person);
+        }
+        let mut e = kept[i];
+        e.person = names.get(e.person);
+        out.push(bucket(mix(e.person), out.parts()), e);
     }
 }
 
-#[inline]
-pub fn route_click(c: &Click, names: &Names, out: &mut [Vec<PersonClick>]) {
-    let person = names.get(c.user);
-    out[bucket(mix(person), out.len())].push(PersonClick {
-        person,
-        ts: c.ts,
-        click_id: c.click_id,
-        campaign: c.campaign,
-    });
+const LAG: usize = 16;
+
+/// Routes clicks to their person's partition, prefetching name lookups ahead.
+pub fn route_clicks(clicks: &[Click], names: &Names, out: &mut Scatter<PersonClick>) {
+    for c in clicks.iter().take(LAG) {
+        names.prefetch(c.user);
+    }
+    for (i, c) in clicks.iter().enumerate() {
+        if let Some(ahead) = clicks.get(i + LAG) {
+            names.prefetch(ahead.user);
+        }
+        let person = names.get(c.user);
+        out.push(
+            bucket(mix(person), out.parts()),
+            PersonClick {
+                person,
+                ts: c.ts,
+                click_id: c.click_id,
+                campaign: c.campaign,
+            },
+        );
+    }
 }
 
 #[derive(Clone, Copy)]

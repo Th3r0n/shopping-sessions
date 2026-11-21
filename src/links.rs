@@ -3,22 +3,63 @@
 
 use std::cmp::Ordering;
 
-use crate::hash::U64Map;
+use crate::hash::{mix, U64Map};
 use crate::key;
 
+/// Open addressing from a linked user key to its person's name: one 16-byte slot
+/// (key, name) per entry, so a lookup touches a single cache line. Key 0 is empty.
 pub struct Names {
-    index: U64Map,
-    name: Vec<u64>,
+    slots: Vec<[u64; 2]>,
+    mask: usize,
 }
 
 impl Names {
+    fn with_entries(n: usize) -> Self {
+        let size = (n.max(8) * 2).next_power_of_two();
+        Self {
+            slots: vec![[0, 0]; size],
+            mask: size - 1,
+        }
+    }
+
+    fn insert(&mut self, user: u64, name: u64) {
+        let mut i = mix(user) as usize & self.mask;
+        while self.slots[i][0] != 0 {
+            i = (i + 1) & self.mask;
+        }
+        self.slots[i] = [user, name];
+    }
+
     /// The person's name for a user key: itself if it appears in no link.
     #[inline]
     pub fn get(&self, user: u64) -> u64 {
-        match self.index.get(user) {
-            Some(i) => self.name[i as usize],
-            None => user,
+        let mut i = mix(user) as usize & self.mask;
+        loop {
+            let [k, name] = self.slots[i];
+            if k == user {
+                return name;
+            }
+            if k == 0 {
+                return user;
+            }
+            i = (i + 1) & self.mask;
         }
+    }
+
+    /// Starts loading the slot `get(user)` will read first.
+    #[inline]
+    pub fn prefetch(&self, user: u64) {
+        let i = mix(user) as usize & self.mask;
+        prefetch(self.slots.as_ptr().wrapping_add(i));
+    }
+}
+
+#[inline]
+pub fn prefetch<T>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching never faults, whatever the address.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
     }
 }
 
@@ -67,6 +108,11 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
             best[r] = keys[i];
         }
     }
-    let name = (0..n).map(|i| best[find(&mut parent, i as u32) as usize]).collect();
-    Names { index, name }
+    let mut names = Names::with_entries(n);
+    for i in 0..n {
+        let name = best[find(&mut parent, i as u32) as usize];
+        names.insert(keys[i], name);
+    }
+    drop(index);
+    names
 }
