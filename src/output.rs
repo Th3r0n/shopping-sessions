@@ -106,9 +106,10 @@ impl Column {
         self.rows += 1;
     }
 
-    /// The page body: definition levels (optional columns) then the values.
-    fn page(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.data.len() + self.rows / 8 + 16);
+    /// The definition levels of an optional column, with their 4-byte length
+    /// (data page v1); empty for a required column. The values follow them.
+    fn levels(&self) -> Vec<u8> {
+        let mut out = Vec::new();
         if self.optional {
             // RLE/bit-packed hybrid, bit width 1, as one bit-packed run, after a
             // 4-byte length (data page v1).
@@ -128,7 +129,6 @@ impl Column {
             out.extend_from_slice(&(levels.len() as u32).to_le_bytes());
             out.extend_from_slice(&levels);
         }
-        out.extend_from_slice(&self.data);
         out
     }
 }
@@ -234,17 +234,30 @@ fn page_header(rows: usize, size: usize) -> Vec<u8> {
 pub fn write(path: &Path, columns: &[Column]) -> std::io::Result<()> {
     let rows = columns.first().map_or(0, |c| c.rows);
     assert!(columns.iter().all(|c| c.rows == rows), "columns differ in length");
-    let mut file = Vec::with_capacity(columns.iter().map(|c| c.data.len() + c.present.len() / 8 + 64).sum::<usize>() + 4096);
-    file.extend_from_slice(b"PAR1");
+    // Written piece by piece straight from the column buffers (no copy of the data).
+    let mut file = std::io::BufWriter::with_capacity(1 << 16, File::create(path)?);
+    let mut at = 0usize;
+    fn put(file: &mut std::io::BufWriter<File>, at: &mut usize, bytes: &[u8]) -> std::io::Result<()> {
+        *at += bytes.len();
+        if bytes.len() >= 1 << 16 {
+            file.flush()?;
+            file.get_mut().write_all(bytes)
+        } else {
+            file.write_all(bytes)
+        }
+    }
+    put(&mut file, &mut at, b"PAR1")?;
     let mut chunks = Vec::new(); // (offset, total size)
     for c in columns {
-        let page = c.page();
-        assert!(page.len() < i32::MAX as usize, "page too large");
-        let header = page_header(rows, page.len());
-        let offset = file.len();
-        file.extend_from_slice(&header);
-        file.extend_from_slice(&page);
-        chunks.push((offset, header.len() + page.len()));
+        let levels = c.levels();
+        let page_len = levels.len() + c.data.len();
+        assert!(page_len < i32::MAX as usize, "page too large");
+        let header = page_header(rows, page_len);
+        let offset = at;
+        put(&mut file, &mut at, &header)?;
+        put(&mut file, &mut at, &levels)?;
+        put(&mut file, &mut at, &c.data)?;
+        chunks.push((offset, header.len() + page_len));
     }
 
     let mut t = Thrift::new();
@@ -307,8 +320,8 @@ pub fn write(path: &Path, columns: &[Column]) -> std::io::Result<()> {
     t.end_struct();
     t.out.push(0); // end of FileMetaData
 
-    file.extend_from_slice(&t.out);
-    file.extend_from_slice(&(t.out.len() as u32).to_le_bytes());
-    file.extend_from_slice(b"PAR1");
-    File::create(path)?.write_all(&file)
+    put(&mut file, &mut at, &t.out)?;
+    put(&mut file, &mut at, &(t.out.len() as u32).to_le_bytes())?;
+    put(&mut file, &mut at, b"PAR1")?;
+    file.flush()
 }
