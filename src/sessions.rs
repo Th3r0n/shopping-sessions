@@ -189,8 +189,9 @@ impl Acc {
         for part in cls {
             c.extend_from_slice(part);
         }
-        e.sort_unstable_by_key(|x| (x.person, x.packed as u32));
-        c.sort_unstable_by_key(|x| (x.person, x.ts));
+        // (person, packed) as one u128 orders by person then ts (see events::pack).
+        e.sort_unstable_by_key(|x| (x.person as u128) << 64 | x.packed as u128);
+        c.sort_unstable_by_key(|x| (x.person as u128) << 64 | (x.ts as u128) << 32 | x.campaign as u128);
         let (mut i, mut ci) = (0usize, 0usize);
         while i < e.len() {
             let person = e[i].person;

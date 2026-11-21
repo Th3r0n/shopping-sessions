@@ -8,31 +8,31 @@ use crate::sessions::PersonClick;
 use crate::lookups::{Campaigns, Products};
 use crate::ts::{self, DAY};
 
-/// The packed word of an event: ts relative to `Context::base` (bits 0-31), price
-/// (32-55), category (56-60) and flags (61-63). main checks at startup that every
-/// in-window ts fits in 32 bits and every category id in 5; otherwise the generic
-/// binary runs instead.
-pub const SURVIVES: u64 = 1 << 61;
-pub const PURCHASE: u64 = 1 << 62;
+/// The packed word of an event: price (bits 0-23), category (24-28), flags (29-31)
+/// and ts relative to `Context::base` (32-63), so that (person, packed) sorts by
+/// person then ts. main checks at startup that every in-window ts fits in 32 bits
+/// and every category id in 5; otherwise the generic binary runs instead.
+pub const SURVIVES: u64 = 1 << 29;
+pub const PURCHASE: u64 = 1 << 30;
 /// `user` already holds the person's name.
-pub const RESOLVED: u64 = 1 << 63;
+pub const RESOLVED: u64 = 1 << 31;
 pub const MAX_CATEGORIES: usize = 32;
 
 #[inline]
 pub fn pack(ts_rel: u32, price: u32, category: u16, flags: u64) -> u64 {
-    ts_rel as u64 | (price as u64) << 32 | (category as u64) << 56 | flags
+    (ts_rel as u64) << 32 | price as u64 | (category as u64) << 24 | flags
 }
 #[inline]
 pub fn ts_of(packed: u64) -> i64 {
-    packed as u32 as i64
+    (packed >> 32) as i64
 }
 #[inline]
 pub fn price_of(packed: u64) -> u32 {
-    (packed >> 32) as u32 & 0x00ff_ffff
+    packed as u32 & 0x00ff_ffff
 }
 #[inline]
 pub fn category_of(packed: u64) -> u16 {
-    (packed >> 56) as u16 & 31
+    (packed >> 24) as u16 & 31
 }
 pub const WEEK: i64 = 7 * DAY;
 
