@@ -197,6 +197,38 @@ fn main() {
         });
         started.elapsed().as_secs_f64()
     };
+    if let (Some(rounds), true) = (env_usize("SS_PARSEBENCH"), std::env::var_os("SS_PARSEBENCH_REUSE").is_some()) {
+        // the same, each thread storing into the same (already faulted) arenas every round
+        let room = est_copies * 13 / 10 / threads;
+        let mut copies: Vec<events::Copies> = (0..threads)
+            .map(|_| events::Copies { compact: Words3::new(eid_parts, room), full: Scatter::new(eid_parts, est_copies / threads / 16, room / 8) })
+            .collect();
+        let mut best = f64::MAX;
+        for _ in 0..rounds.max(1) {
+            let next = AtomicUsize::new(0);
+            let started = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for parts in copies.iter_mut() {
+                    let (next, cx, event_chunks, event_input) = (&next, &cx, &event_chunks, &event_input);
+                    s.spawn(move || {
+                        parts.compact.reset();
+                        parts.full.reset();
+                        let mut buf = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(c) = event_chunks.get(i) else { break };
+                            event_input.parse::<7, _>(c, &mut buf, simd, &mut |f| events::event_fields(f, cx, parts));
+                        }
+                        parts.compact.finish();
+                        parts.full.finish();
+                    });
+                }
+            });
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        eprintln!("parsebench: events parsed in {best:.4}s (best of {rounds}, reused arenas)");
+        exit_now();
+    }
     if let Some(rounds) = env_usize("SS_PARSEBENCH") {
         // the fastest of `rounds` rounds is printed and the process ends
         let dry = std::env::var_os("SS_PARSEBENCH_DRY").is_some();
@@ -215,6 +247,18 @@ fn main() {
             a = a.min(parse_round(&event_input, &event_chunks, false));
             b = b.min(parse_round(&pread_input, &pread_chunks, false));
         }
+        probe::set_ab(a, b);
+    }
+    if probe_mode.as_deref() == Some("ab-thp") {
+        // the same parse with arenas advised for huge pages (A) and against them (B)
+        let (mut a, mut b) = (f64::MAX, f64::MAX);
+        for _ in 0..2 {
+            std::env::remove_var("SS_THP");
+            a = a.min(parse_round(&event_input, &event_chunks, false));
+            std::env::set_var("SS_THP", "0");
+            b = b.min(parse_round(&event_input, &event_chunks, false));
+        }
+        std::env::remove_var("SS_THP");
         probe::set_ab(a, b);
     }
     if probe_mode.as_deref() == Some("ab-scatter") {

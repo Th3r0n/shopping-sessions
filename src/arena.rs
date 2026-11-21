@@ -271,6 +271,23 @@ impl<T: Copy> Scatter<T> {
         self.free.extend(blocks.iter().map(|&b| b as *mut T));
     }
 
+    /// Benchmark only: forgets every value and refills the same memory from the start.
+    pub fn reset(&mut self) {
+        self.used = 0;
+        for b in &mut self.blocks {
+            b.clear();
+        }
+        self.current.fill(std::ptr::null_mut());
+        self.fill.fill(self.block);
+        self.free.clear();
+        for o in &mut self.overflow {
+            o.clear();
+        }
+        self.staged.fill(0);
+        let size = std::mem::size_of::<T>();
+        self.per_line = if size > 0 && size <= 64 && 64 % size == 0 { 64 / size } else { 0 };
+    }
+
     /// Writes out the partly filled staging lines; after this only `push` may be used.
     pub fn finish(&mut self) {
         for p in 0..self.staged.len() {
@@ -434,6 +451,18 @@ impl Words3 {
         self.blocks[p].push(b);
         self.current[p] = b;
         self.fill[p] = 0;
+    }
+
+    /// Benchmark only: forgets every record and refills the first region from the start.
+    pub fn reset(&mut self) {
+        self.regions.truncate(1);
+        self.used = 0;
+        for b in &mut self.blocks {
+            b.clear();
+        }
+        self.current.fill(std::ptr::null_mut());
+        self.fill.fill(WORDS3_BLOCK as u32);
+        self.staged.fill(0);
     }
 
     /// Writes out the staged words (which end whole records); call before reading.
