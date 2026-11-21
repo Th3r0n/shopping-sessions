@@ -151,3 +151,4 @@ core at exit. But stage45 already unmaps the input mapping (REGION_UNMAP, on by 
 that old range hits whatever was mapped there since: under SDE at NCPU=3 every run crashed or hung (7/7),
 at NCPU=8 a p20 run hung once. Releasing only the arrays and the heap: 3/3 fine at NCPU=3. Our version makes
 "2" the default and releases the input range only while it is still mapped (out::REGION_UNMAPPED).
+| P10 ab-env | f25f301 | V0 XL_ENDREL=auto (old default), V1 new default (guarded release), V2 + XL_COREFIRST=1, V3 + XL_RGREL=0 | 8.09 s | k = 0: none beats the old default; fixed cost ~0.09 s. So the P9 gain came from releasing the stale input range |

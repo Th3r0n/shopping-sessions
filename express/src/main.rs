@@ -477,7 +477,8 @@ fn main() {
                 // The input mapping, only while it is still mapped: stage45 normally unmaps it
                 // already, and a release of the old range would hit whatever has been mapped
                 // there since (a crash or a hang: seen under SDE at NCPU=3).
-                if endrel.as_deref() == Some("2") && !out::REGION_UNMAPPED.load(std::sync::atomic::Ordering::Acquire) { let tot = g.files.last().map_or(0, |f| f.off + f.len); v(g.region.wrapping_add(tot * tid / nt), tot * (tid + 1) / nt - tot * tid / nt) } else { (0, 0) },
+                // XL_RELSTALE=1 (measurement only) releases it anyway, as the original code did.
+                if endrel.as_deref() == Some("2") && (!out::REGION_UNMAPPED.load(std::sync::atomic::Ordering::Acquire) || std::env::var("XL_RELSTALE").is_ok_and(|v| v == "1")) { let tot = g.files.last().map_or(0, |f| f.off + f.len); v(g.region.wrapping_add(tot * tid / nt), tot * (tid + 1) / nt - tot * tid / nt) } else { (0, 0) },
                 (0, 0),
             ];
         }
