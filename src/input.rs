@@ -236,6 +236,18 @@ unsafe fn block_masks(p: *const u8) -> (u64, u64, u64) {
     (n, c, q)
 }
 
+/// 1 when `buf[start..end]` is a quoted field (at least 2 bytes, a quote at each
+/// end), else 0; without branches, as fields are quoted at random.
+#[inline(always)]
+unsafe fn quoted_field(buf: &[u8], start: usize, end: usize) -> usize {
+    // Both reads stay inside the buffer for any width (an empty last field can
+    // end the buffer); their values only matter when the width is at least 2.
+    let top = buf.len().saturating_sub(1);
+    let first = *buf.get_unchecked(start.min(top));
+    let last = *buf.get_unchecked(end.saturating_sub(1).min(top));
+    ((end >= start + 2) & (first == b'"') & (last == b'"')) as usize
+}
+
 /// Bits from `from` (0..=64) upwards.
 #[inline(always)]
 fn bits_from(from: usize) -> u64 {
@@ -286,14 +298,9 @@ unsafe fn simd_range<const N: usize, F: FnMut(&[&[u8]; N])>(
             if (nl >> i) & 1 == 0 {
                 // a comma ends field k
                 if k + 1 < N {
-                    let field = buf.get_unchecked(field_start..pos);
-                    let w = field.len();
-                    *out.get_unchecked_mut(k) = if w >= 2 && field[0] == b'"' && field[w - 1] == b'"' {
-                        quoted += 1;
-                        buf.get_unchecked(field_start + 1..pos - 1)
-                    } else {
-                        field
-                    };
+                    let q = quoted_field(buf, field_start, pos);
+                    quoted += q as u32;
+                    *out.get_unchecked_mut(k) = buf.get_unchecked(field_start + q..pos - q);
                     k += 1;
                 } else {
                     too_many = true;
@@ -306,14 +313,9 @@ unsafe fn simd_range<const N: usize, F: FnMut(&[&[u8]; N])>(
             counted = i + 1;
             let line_end = pos.min(data_len);
             if !too_many && k + 1 == N && line_end > line_start {
-                let field = buf.get_unchecked(field_start..line_end);
-                let w = field.len();
-                *out.get_unchecked_mut(N - 1) = if w >= 2 && field[0] == b'"' && field[w - 1] == b'"' {
-                    quoted += 1;
-                    buf.get_unchecked(field_start + 1..line_end - 1)
-                } else {
-                    field
-                };
+                let q = quoted_field(buf, field_start, line_end);
+                quoted += q as u32;
+                *out.get_unchecked_mut(N - 1) = buf.get_unchecked(field_start + q..line_end - q);
                 if quotes == 2 * quoted {
                     f(&out);
                 }
