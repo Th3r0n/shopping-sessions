@@ -75,10 +75,12 @@ pub struct Scatter<T: Copy> {
     capacity: usize,
     used: usize,
     block: usize,
-    /// Per partition: its blocks (as block numbers), and how full the last one is.
-    blocks: Vec<Vec<u32>>,
-    current: Vec<usize>,
+    /// Per partition: its blocks, and how full the last one is.
+    blocks: Vec<Vec<*mut T>>,
+    current: Vec<*mut T>,
     fill: Vec<usize>,
+    /// Blocks handed over by `adopt` (memory already touched), used before the arena.
+    free: Vec<*mut T>,
     overflow: Vec<Vec<T>>,
     /// Software write-combining: per partition, one cache line of values waiting
     /// to be written with non-temporal stores (when a line holds whole values).
@@ -91,6 +93,10 @@ pub struct Scatter<T: Copy> {
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 struct Line([u8; 64]);
+
+/// Block size of the write-combined scatters, the same for every record type so
+/// that blocks can move from one scatter to another.
+pub const BLOCK_BYTES: usize = 4096;
 
 /// Copies one 64-byte line with non-temporal stores (no read of the destination).
 #[inline(always)]
@@ -118,10 +124,11 @@ impl<T: Copy> Scatter<T> {
     pub fn new(parts: usize, expected: usize, capacity: usize) -> Self {
         let size = std::mem::size_of::<T>();
         let per_line = if size > 0 && size <= 64 && 64 % size == 0 { 64 / size } else { 0 };
-        let mut block = (expected / parts.max(1) / 8).clamp(16, 1024);
-        if per_line > 0 {
-            block = block.div_ceil(per_line) * per_line; // blocks are whole lines
-        }
+        let block = if per_line > 0 {
+            BLOCK_BYTES / size // whole lines, and the same bytes for every such T
+        } else {
+            (expected / parts.max(1) / 8).clamp(16, 1024)
+        };
         let capacity = capacity + parts * block;
         Self {
             region: Region::new(capacity),
@@ -129,8 +136,9 @@ impl<T: Copy> Scatter<T> {
             used: 0,
             block,
             blocks: (0..parts).map(|_| Vec::new()).collect(),
-            current: vec![0; parts],
+            current: vec![std::ptr::null_mut(); parts],
             fill: vec![block; parts],
+            free: Vec::new(),
             overflow: (0..parts).map(|_| Vec::new()).collect(),
             staging: vec![Line([0; 64]); if per_line > 0 { parts } else { 0 }],
             staged: vec![0; parts],
@@ -155,28 +163,52 @@ impl<T: Copy> Scatter<T> {
         }
     }
 
+    /// A block for partition p (recycled first), or None when the arena is full.
+    #[inline]
+    fn new_block(&mut self, p: usize) -> Option<*mut T> {
+        let b = match self.free.pop() {
+            Some(b) => b,
+            None if self.used + self.block <= self.capacity => {
+                // SAFETY: used + block <= capacity, inside the region.
+                let b = unsafe { self.region.ptr.add(self.used) };
+                self.used += self.block;
+                b
+            }
+            None => return None,
+        };
+        self.blocks[p].push(b);
+        self.current[p] = b;
+        self.fill[p] = 0;
+        Some(b)
+    }
+
     #[inline(never)]
     fn flush_line(&mut self, p: usize) {
-        if self.fill[p] == self.block {
-            if self.used + self.block > self.capacity {
-                // SAFETY: the staging line holds per_line written values.
-                let values =
-                    unsafe { std::slice::from_raw_parts(self.staging.as_ptr().add(p) as *const T, self.per_line) };
-                self.overflow[p].extend_from_slice(values);
-                return;
-            }
-            let start = self.used;
-            self.used += self.block;
-            self.blocks[p].push((start / self.block) as u32);
-            self.current[p] = start;
-            self.fill[p] = 0;
+        if self.fill[p] == self.block && self.new_block(p).is_none() {
+            // SAFETY: the staging line holds per_line written values.
+            let values = unsafe { std::slice::from_raw_parts(self.staging.as_ptr().add(p) as *const T, self.per_line) };
+            self.overflow[p].extend_from_slice(values);
+            return;
         }
         // SAFETY: blocks are whole, 64-byte aligned lines and fill counts whole lines.
         unsafe {
-            let dst = self.region.ptr.add(self.current[p] + self.fill[p]) as *mut u8;
+            let dst = self.current[p].add(self.fill[p]) as *mut u8;
             stream_line(dst, self.staging.as_ptr().add(p) as *const u8);
         }
         self.fill[p] += self.per_line;
+    }
+
+    /// The blocks of partition p as raw memory, to be handed to `adopt` once its
+    /// values are no longer needed.
+    pub fn blocks_of(&self, p: usize) -> &[*mut T] {
+        &self.blocks[p]
+    }
+
+    /// Takes over blocks of BLOCK_BYTES bytes (from another Scatter whose values in
+    /// them are dead) to fill before carving fresh arena memory.
+    pub fn adopt<U>(&mut self, blocks: &[*mut U]) {
+        debug_assert!(self.block * std::mem::size_of::<T>() == BLOCK_BYTES);
+        self.free.extend(blocks.iter().map(|&b| b as *mut T));
     }
 
     /// Writes out the partly filled staging lines; after this only `push` may be used.
@@ -206,8 +238,8 @@ impl<T: Copy> Scatter<T> {
     pub fn push(&mut self, p: usize, value: T) {
         let f = self.fill[p];
         if f < self.block {
-            // SAFETY: current[p] + f lies inside a block of the region.
-            unsafe { self.region.ptr.add(self.current[p] + f).write(value) };
+            // SAFETY: current[p] + f lies inside the partition's current block.
+            unsafe { self.current[p].add(f).write(value) };
             self.fill[p] = f + 1;
         } else {
             self.push_new_block(p, value);
@@ -216,16 +248,13 @@ impl<T: Copy> Scatter<T> {
 
     #[cold]
     fn push_new_block(&mut self, p: usize, value: T) {
-        if self.used + self.block <= self.capacity {
-            let start = self.used;
-            self.used += self.block;
-            self.blocks[p].push((start / self.block) as u32);
-            self.current[p] = start;
-            // SAFETY: start is the beginning of a fresh block inside the region.
-            unsafe { self.region.ptr.add(start).write(value) };
-            self.fill[p] = 1;
-        } else {
-            self.overflow[p].push(value);
+        match self.new_block(p) {
+            Some(b) => {
+                // SAFETY: b is the start of a block of `block` values.
+                unsafe { b.write(value) };
+                self.fill[p] = 1;
+            }
+            None => self.overflow[p].push(value),
         }
     }
 
@@ -240,7 +269,7 @@ impl<T: Copy> Scatter<T> {
             .map(move |(i, &b)| {
                 let len = if i == last { self.fill[p] } else { self.block };
                 // SAFETY: the first len values of the block were written by push.
-                unsafe { std::slice::from_raw_parts(self.region.ptr.add(b as usize * self.block), len) }
+                unsafe { std::slice::from_raw_parts(b as *const T, len) }
             })
             .chain(std::iter::once(self.overflow[p].as_slice()))
     }
@@ -272,6 +301,28 @@ mod tests {
                 let all: Vec<u64> = s.part(p).flatten().map(|v| v[0]).collect();
                 assert_eq!(all, (0..3001).filter(|i| i * 7 % 5 == p as u64).collect::<Vec<_>>());
             }
+        }
+    }
+
+    #[test]
+    fn adopted_blocks_are_reused() {
+        let mut a: Scatter<[u64; 4]> = Scatter::new(3, 1000, 2000);
+        for i in 0..1500u64 {
+            a.push_wc((i % 3) as usize, [i; 4]);
+        }
+        a.finish();
+        let mut b: Scatter<[u64; 2]> = Scatter::new(2, 100, 0); // almost no arena of its own
+        for p in 0..3 {
+            let blocks: Vec<_> = a.blocks_of(p).to_vec();
+            b.adopt(&blocks);
+        }
+        for i in 0..1200u64 {
+            b.push_wc((i % 2) as usize, [i, i]);
+        }
+        b.finish();
+        for p in 0..2 {
+            let all: Vec<u64> = b.part(p).flatten().map(|v| v[0]).collect();
+            assert_eq!(all, (0..1200).filter(|i| i % 2 == p as u64).collect::<Vec<_>>());
         }
     }
 

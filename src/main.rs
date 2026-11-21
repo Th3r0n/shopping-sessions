@@ -214,6 +214,7 @@ fn main() {
 
     // Phase 2: dedup and route to person partitions.
     let person_room = est_copies * 13 / 10 / threads;
+    let recycle = std::env::var("SS_RECYCLE").as_deref() != Ok("0");
     let next = AtomicUsize::new(0);
     let person_events: Vec<Scatter<PersonEvent>> =
         std::thread::scope(|s| {
@@ -233,6 +234,14 @@ fn main() {
                             slices.clear();
                             slices.extend(event_parts.iter().flat_map(|t| t.part(p)));
                             sessions::dedup(&slices, names, &mut table, &mut kept, &mut evs);
+                            slices.clear();
+                            // Partition p is done: its blocks become this thread's
+                            // (already touched) memory for person events.
+                            if recycle {
+                                for t in event_parts.iter() {
+                                    evs.adopt(t.blocks_of(p));
+                                }
+                            }
                         }
                         evs.finish();
                         evs
