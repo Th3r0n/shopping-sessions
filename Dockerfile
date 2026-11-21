@@ -30,5 +30,5 @@ FROM scratch
 COPY --from=build /shopping-sessions /shopping-sessions
 COPY --from=build /shopping-sessions-generic /shopping-sessions-generic
 USER 1000:1000
-ENV SS_PROBE=bw
+ENV SS_PROBE=phase:parse
 CMD ["/shopping-sessions"]
