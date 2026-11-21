@@ -31,26 +31,25 @@ pub struct PersonClick {
     pub campaign: u32,
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct Slot {
-    event_id: u64,
-    /// Position of the kept copy among the partition's copies, in slice order.
-    at: u32,
-    /// The partition this entry belongs to: an entry of an earlier one is empty,
-    /// so the table is never cleared.
-    generation: u32,
-}
-
-/// A dedup table reused across partitions without clearing it.
+/// A dedup table reused across partitions without clearing it. A slot packs the
+/// kept copy's position (bits 0..32), 24 bits of its event_id's hash (32..56) and
+/// the partition's generation (56..64): a slot of another generation is empty.
 #[derive(Default)]
 pub struct Table {
-    slots: Vec<Slot>,
-    generation: u32,
+    slots: Vec<u64>,
+    generation: u64,
+    /// One bit per copy of the partition: set when another copy wins.
+    lost: Vec<u64>,
+    /// The dense number of each slice's first copy.
+    first: Vec<u32>,
 }
 
 /// Keeps, per event_id, the copy with the smallest ingest_ts (copies tied on it are
 /// identical) and sends the kept copies that survive to their person's partition.
 /// `parts` holds this event_id partition's copies, one slice per parsing thread.
+///
+/// The first pass inserts every copy into a small table and marks the copies that
+/// lose; the second reads the copies again in order, skipping the losers.
 #[inline(never)]
 pub fn dedup(
     parts: &[&[EventCopy]],
@@ -64,58 +63,81 @@ pub fn dedup(
         return;
     }
     assert!(n < u32::MAX as usize, "partition too large");
-    // A position packs the slice index in its high bits and the offset in the rest.
+    // A position packs the slice index in its high bits and the offset in the rest;
+    // `first[k]` is the dense number of slice k's first copy.
     let slice_bits = usize::BITS - (parts.len().max(2) - 1).leading_zeros();
     let shift = 32 - slice_bits;
     assert!(parts.iter().all(|p| (p.len() as u64) < (1u64 << shift)), "partition too large");
     let offset_mask = (1u64 << shift) - 1;
-    let copy_at = |at: u32| -> &EventCopy {
-        let at = at as u64;
-        &parts[(at >> shift) as usize][(at & offset_mask) as usize]
-    };
-    let slots = (n * 2).next_power_of_two();
-    let mask = slots - 1;
-    if table.slots.len() < slots {
-        table.slots.resize(slots, Slot::default());
+    let copy_at = |at: u64| -> &EventCopy { &parts[(at >> shift) as usize][(at & offset_mask) as usize] };
+    table.first.clear();
+    let mut acc = 0u32;
+    for part in parts {
+        table.first.push(acc);
+        acc += part.len() as u32;
     }
-    table.generation = table.generation.wrapping_add(1);
-    if table.generation == 0 {
-        // after 2^32 partitions: start over from a clean table
-        table.slots.iter_mut().for_each(|s| *s = Slot::default());
+    let first = &table.first;
+    let dense = |at: u64| -> usize { first[(at >> shift) as usize] as usize + (at & offset_mask) as usize };
+
+    let size = (n * 2).next_power_of_two();
+    let mask = size - 1;
+    if table.slots.len() < size {
+        table.slots.resize(size, 0);
+    }
+    table.generation += 1;
+    if table.generation == 256 {
+        // the 8-bit generation wrapped: start over from a clean table
+        table.slots.iter_mut().for_each(|s| *s = 0);
         table.generation = 1;
     }
-    let generation = table.generation;
-    let table = &mut table.slots[..slots];
+    let generation = table.generation << 56;
+    let lost_words = n.div_ceil(64);
+    table.lost.clear();
+    table.lost.resize(lost_words, 0);
+    let lost = &mut table.lost;
+    let slots = &mut table.slots[..size];
     for (k, part) in parts.iter().enumerate() {
         for (o, c) in part.iter().enumerate() {
-            let at = (((k as u64) << shift) | o as u64) as u32;
-            let mut i = mix(c.event_id) as usize & mask;
+            let at = ((k as u64) << shift) | o as u64;
+            let h = mix(c.event_id);
+            let tag = (h >> 40) << 32; // 24 bits, above the position
+            let mut i = h as usize & mask;
             loop {
-                let s = &mut table[i];
-                if s.generation != generation {
-                    *s = Slot { event_id: c.event_id, at, generation };
+                let s = slots[i];
+                if s >> 56 << 56 != generation {
+                    slots[i] = generation | tag | at;
                     break;
                 }
-                if s.event_id == c.event_id {
-                    // A duplicate (rare): the smaller ingest_ts wins; ties are identical copies.
-                    if c.ingest < copy_at(s.at).ingest {
-                        s.at = at;
+                if s & (0xff_ffff << 32) == tag {
+                    let old = s & 0xffff_ffff;
+                    let other = copy_at(old);
+                    if other.event_id == c.event_id {
+                        // A duplicate (rare): the smaller ingest_ts wins; ties are identical copies.
+                        let loser = if c.ingest < other.ingest {
+                            slots[i] = generation | tag | at;
+                            old
+                        } else {
+                            at
+                        };
+                        let d = dense(loser);
+                        lost[d / 64] |= 1 << (d % 64);
+                        break;
                     }
-                    break;
                 }
                 i = (i + 1) & mask;
             }
         }
     }
-    // The kept copies that survive, then their names: the name lookups miss the
-    // cache, so each one is prefetched LAG entries ahead.
+    // The kept copies that survive, in order, then their names: the name lookups
+    // miss the cache, so each one is prefetched LAG entries ahead.
     kept.clear();
-    for s in table.iter() {
-        if s.generation != generation {
-            continue;
-        }
-        let c = copy_at(s.at);
-        if c.packed & SURVIVES != 0 {
+    for (k, part) in parts.iter().enumerate() {
+        let base = first[k] as usize;
+        for (o, c) in part.iter().enumerate() {
+            let d = base + o;
+            if c.packed & SURVIVES == 0 || (lost[d / 64] >> (d % 64)) & 1 != 0 {
+                continue;
+            }
             let e = PersonEvent {
                 person: c.user,
                 packed: c.packed,
@@ -127,12 +149,20 @@ pub fn dedup(
             }
         }
     }
+    // Two prefetch steps: the filter word 2 LAG ahead, then (only for the keys the
+    // filter does not clear) the table slot LAG ahead.
+    for e in kept.iter().take(2 * LAG) {
+        names.prefetch_filter(e.person);
+    }
     for e in kept.iter().take(LAG) {
-        names.prefetch(e.person);
+        names.prefetch_if_renamed(e.person);
     }
     for i in 0..kept.len() {
+        if let Some(far) = kept.get(i + 2 * LAG) {
+            names.prefetch_filter(far.person);
+        }
         if let Some(ahead) = kept.get(i + LAG) {
-            names.prefetch(ahead.person);
+            names.prefetch_if_renamed(ahead.person);
         }
         let mut e = kept[i];
         e.person = names.get(e.person);

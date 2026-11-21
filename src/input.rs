@@ -167,6 +167,9 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) {
 }
 
 /// True if the AVX2 splitter can be used (and SS_SCALAR is not set).
+static PREFETCH_DISTANCE: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| std::env::var("SS_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+
 pub fn use_simd() -> bool {
     if std::env::var_os("SS_SCALAR").is_some() {
         return false;
@@ -280,6 +283,10 @@ unsafe fn simd_range<const N: usize, F: FnMut(&[&[u8]; N])>(
     while line_start < end {
         // Masks of this block; past the data (or the buffer) every byte is '\n'.
         let (nl, comma, quote) = if block + 64 <= data_len.min(buf.len()) {
+            let d = *PREFETCH_DISTANCE;
+            if d != 0 {
+                std::arch::x86_64::_mm_prefetch(buf.as_ptr().wrapping_add(block + d) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            }
             block_masks(buf.as_ptr().add(block))
         } else {
             let mut tail = [b'\n'; 64];

@@ -8,9 +8,16 @@ use crate::key;
 
 /// Open addressing from a linked user key to its person's name: one 16-byte slot
 /// (key, name) per entry, so a lookup touches a single cache line. Key 0 is empty.
+///
+/// A bitset over the keys' hashes, small enough for the last-level cache, holds a
+/// bit for every key named by another key: a key whose bit is clear names itself,
+/// without reading the table (most keys).
 pub struct Names {
     slots: &'static mut [[u64; 2]],
     size: usize,
+    filter: &'static mut [u64],
+    /// 64 - log2(filter bits); 0 while there is no filter (during the build).
+    shift: u32,
 }
 
 impl Names {
@@ -21,6 +28,8 @@ impl Names {
         Self {
             slots: crate::arena::zeroed_slice(size),
             size,
+            filter: &mut [],
+            shift: 0,
         }
     }
 
@@ -29,10 +38,32 @@ impl Names {
         crate::hash::bucket(mix(key), self.size)
     }
 
+    /// The filter word and bit of a key's hash.
+    #[inline]
+    fn filter_bit(&self, h: u64) -> (usize, u32) {
+        let b = (h >> self.shift) as usize;
+        (b / 64, (b % 64) as u32)
+    }
+
+    /// False when the key surely names itself.
+    #[inline]
+    fn maybe_renamed(&self, h: u64) -> bool {
+        if self.shift == 0 {
+            return true;
+        }
+        let (w, b) = self.filter_bit(h);
+        // SAFETY: the word index is below filter.len() = 2^(64 - shift) / 64.
+        (unsafe { *self.filter.get_unchecked(w) } >> b) & 1 != 0
+    }
+
     /// The person's name for a user key: itself if it appears in no link.
     #[inline]
     pub fn get(&self, user: u64) -> u64 {
-        let mut i = self.home(user);
+        let h = mix(user);
+        if !self.maybe_renamed(h) {
+            return user;
+        }
+        let mut i = crate::hash::bucket(h, self.size);
         loop {
             let [k, name] = self.slots[i];
             if k == user {
@@ -48,11 +79,37 @@ impl Names {
         }
     }
 
-    /// Starts loading the slot `get(user)` will read first.
+    /// Starts loading the slot `get(user)` will read first (and the filter word).
     #[inline]
     pub fn prefetch(&self, user: u64) {
-        let i = self.home(user);
-        prefetch(self.slots.as_ptr().wrapping_add(i));
+        let h = mix(user);
+        prefetch(self.slots.as_ptr().wrapping_add(crate::hash::bucket(h, self.size)));
+        if self.shift != 0 {
+            prefetch(self.filter.as_ptr().wrapping_add(self.filter_bit(h).0));
+        }
+    }
+
+    /// First of two prefetch steps: the filter word.
+    #[inline]
+    pub fn prefetch_filter(&self, user: u64) {
+        if self.shift != 0 {
+            prefetch(self.filter.as_ptr().wrapping_add(self.filter_bit(mix(user)).0));
+        }
+    }
+
+    /// Second step, once the filter word has arrived: the slot, if it will be read.
+    #[inline]
+    pub fn prefetch_if_renamed(&self, user: u64) {
+        let h = mix(user);
+        if self.maybe_renamed(h) {
+            prefetch(self.slots.as_ptr().wrapping_add(crate::hash::bucket(h, self.size)));
+        }
+    }
+
+    /// Only the slot (while building).
+    #[inline]
+    fn prefetch_slot(&self, key: u64) {
+        prefetch(self.slots.as_ptr().wrapping_add(self.home(key)));
     }
 }
 
@@ -119,8 +176,8 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
     let mut near = pairs.iter().flatten();
     let mut ring = [(0u32, 0u32); L];
     for &(x, y) in far.by_ref().take(2 * L) {
-        names.prefetch(x);
-        names.prefetch(y);
+        names.prefetch_slot(x);
+        names.prefetch_slot(y);
     }
     let prefetch_node = |node: &Vec<[u32; 2]>, n: u32| prefetch(node.as_ptr().wrapping_add(n as usize));
     for (k, &(a, b)) in near.by_ref().take(L).enumerate() {
@@ -131,8 +188,8 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
     for i in 0..total {
         let (na, nb) = ring[i % L];
         if let Some(&(x, y)) = far.next() {
-            names.prefetch(x);
-            names.prefetch(y);
+            names.prefetch_slot(x);
+            names.prefetch_slot(y);
         }
         let ra = find(&mut node, na);
         let rb = find(&mut node, nb);
@@ -170,12 +227,27 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
             best[r] = keys[i];
         }
     }
+    // The filter: SS_FILTER bits per node (0 = none).
+    let per_node = std::env::var("SS_FILTER").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8);
+    let mut filter: &'static mut [u64] = &mut [];
+    let mut shift = 0;
+    if per_node > 0 {
+        let bits = (n * per_node).next_power_of_two().max(64);
+        filter = crate::arena::zeroed_slice(bits / 64);
+        shift = 64 - bits.trailing_zeros();
+    }
     let mut name_of = keys; // reused: each node's key becomes its name
     for i in 0..n {
         if let Some(ahead) = node.get(i + L) {
             prefetch(best.as_ptr().wrapping_add(ahead[0] as usize));
         }
-        name_of[i] = best[node[i][0] as usize];
+        let key = name_of[i];
+        let name = best[node[i][0] as usize];
+        name_of[i] = name;
+        if shift != 0 && name != key {
+            let b = (mix(key) >> shift) as usize;
+            filter[b / 64] |= 1 << (b % 64);
+        }
     }
     let slots = &mut *names.slots;
     for j in 0..slots.len() {
@@ -189,6 +261,9 @@ pub fn build(pairs: &[Vec<(u64, u64)>]) -> Names {
             slot[1] = name_of[slot[1] as usize];
         }
     }
+    let mut names = names;
+    names.filter = filter;
+    names.shift = shift;
     if std::env::var_os("SS_DEBUG").is_some() {
         eprintln!(
             "links: alloc {t1:.3}s, unions {:.3}s, names {:.3}s, {} nodes, {} slots",
