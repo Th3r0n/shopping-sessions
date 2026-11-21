@@ -100,3 +100,13 @@ Local cold page cache (drop_caches before the run): 1.42-1.5 s instead of 0.83 s
 does not help cold (1.434 vs 1.419 s): 8 threads populating 2 MiB chunks already keep the disk busy.
 Also neutral: unmapping whole files in parallel after the parse instead of per-chunk MADV_DONTNEED (+1.1%),
 deferred name lookups without the filter check (+0.1%, kept: it is the same result with less work).
+
+## Scorer probes (commits that set ENV SS_PROBE in the Dockerfile; never candidates)
+
+| probe | commit | encodes | score | reading |
+| --- | --- | --- | --- | --- |
+| P1 time | ca191b5 | sleep 10 x own time to output written | 10.28 s | own time T ~0.92 s (fixed + 11 T), vs ~0.56 s locally: 1.63x; fixed cost ~0.1 s |
+
+So the score is almost all our process time, on CPUs about 1.6x slower than the local i7 for this code.
+Leaderboard (21 Nov afternoon): #1 0.31 s, then 0.52, 0.52, 0.54, 0.58; we 69th at 1.05. Below 0.50 s needs
+T below ~0.38 s on the scorer, about 2.4x less than now.
