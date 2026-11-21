@@ -49,6 +49,21 @@ impl<T> Region<T> {
     }
 }
 
+/// A zero-filled slice of n values that lives until exit, on huge pages on Linux.
+/// T must be valid when all-zero.
+pub fn zeroed_slice<T: Copy>(n: usize) -> &'static mut [T] {
+    let region = Region::<T>::new(n);
+    let ptr = region.ptr;
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: the allocation holds n values; zero them, then keep it alive forever.
+        unsafe { std::ptr::write_bytes(ptr, 0, n.max(1)) };
+        std::mem::forget(region);
+    }
+    // SAFETY: n values of zeroed (anonymous mappings are zero-filled) memory, never freed.
+    unsafe { std::slice::from_raw_parts_mut(ptr, n) }
+}
+
 pub struct Scatter<T: Copy> {
     region: Region<T>,
     cap: usize,

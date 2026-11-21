@@ -122,7 +122,12 @@ fn main() {
                 let (event_chunks, click_chunks, event_input, click_input, next, cx, link_pairs) =
                     (&event_chunks, &click_chunks, &event_input, &click_input, &next, &cx, &link_pairs);
                 s.spawn(move || {
-                    let names = (t == 0).then(|| links::build(link_pairs));
+                    let names = (t == 0).then(|| {
+                        let started = std::time::Instant::now();
+                        let names = links::build(link_pairs);
+                        eprintln!("           names built in {:.3}s on thread 0", started.elapsed().as_secs_f64());
+                        names
+                    });
                     let mut parts: Scatter<EventCopy> = Scatter::new(eid_parts, reserve);
                     let mut clicks: Scatter<Click> = Scatter::new(1, click_reserve);
                     let mut buf = Vec::new();

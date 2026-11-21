@@ -18,58 +18,6 @@ pub fn bucket(hash: u64, n: usize) -> usize {
     (((hash >> 32) * n as u64) >> 32) as usize
 }
 
-/// Open addressing from non-zero u64 keys to u32 values (0 marks an empty slot).
-pub struct U64Map {
-    keys: Vec<u64>,
-    values: Vec<u32>,
-    mask: usize,
-    len: usize,
-}
-
-impl U64Map {
-    pub fn with_capacity(n: usize) -> Self {
-        let slots = (n.max(8) * 2).next_power_of_two();
-        Self {
-            keys: vec![0; slots],
-            values: vec![0; slots],
-            mask: slots - 1,
-            len: 0,
-        }
-    }
-
-    /// The value for `key`, inserting `value` if it is absent; true if inserted.
-    #[inline]
-    pub fn get_or_insert(&mut self, key: u64, value: u32) -> (u32, bool) {
-        if (self.len + 1) * 2 > self.keys.len() {
-            self.grow();
-        }
-        let mut i = mix(key) as usize & self.mask;
-        loop {
-            let k = self.keys[i];
-            if k == key {
-                return (self.values[i], false);
-            }
-            if k == 0 {
-                self.keys[i] = key;
-                self.values[i] = value;
-                self.len += 1;
-                return (value, true);
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-
-    fn grow(&mut self) {
-        let mut bigger = U64Map::with_capacity(self.keys.len());
-        for (i, &k) in self.keys.iter().enumerate() {
-            if k != 0 {
-                bigger.get_or_insert(k, self.values[i]);
-            }
-        }
-        *self = bigger;
-    }
-}
-
 /// A fast hasher for std maps keyed by u64.
 #[derive(Default)]
 pub struct MixHasher(u64);

@@ -35,13 +35,14 @@ pub struct PersonClick {
 #[derive(Clone, Copy, Default)]
 pub struct Slot {
     event_id: u64,
-    ingest: i64,
-    at: u64,
+    /// Position of the kept copy among the partition's copies, in slice order.
+    at: u32,
 }
 
 /// Keeps, per event_id, the copy with the smallest ingest_ts (copies tied on it are
 /// identical) and sends the kept copies that survive to their person's partition.
 /// `parts` holds this event_id partition's copies, one slice per parsing thread.
+#[inline(never)]
 pub fn dedup(
     parts: &[&[EventCopy]],
     names: &Names,
@@ -53,29 +54,42 @@ pub fn dedup(
     if n == 0 {
         return;
     }
+    assert!(n < u32::MAX as usize, "partition too large");
+    // starts[k]: position of the first copy of parts[k]
+    let mut starts = [0u32; 65];
+    assert!(parts.len() < starts.len(), "too many slices");
+    for (k, part) in parts.iter().enumerate() {
+        starts[k + 1] = starts[k] + part.len() as u32;
+    }
+    let starts = &starts[..parts.len() + 1];
+    let copy_at = |at: u32| -> &EventCopy {
+        let k = starts.partition_point(|&s| s <= at) - 1;
+        &parts[k][(at - starts[k]) as usize]
+    };
     let slots = (n * 2).next_power_of_two();
     let mask = slots - 1;
     table.clear();
     table.resize(slots, Slot::default());
-    for (t, part) in parts.iter().enumerate() {
-        for (o, c) in part.iter().enumerate() {
-            let at = (t as u64) << 32 | o as u64;
+    let mut at = 0u32;
+    for part in parts {
+        for c in part.iter() {
             let mut i = mix(c.event_id) as usize & mask;
             loop {
                 let s = &mut table[i];
                 if s.event_id == 0 {
-                    *s = Slot { event_id: c.event_id, ingest: c.ingest, at };
+                    *s = Slot { event_id: c.event_id, at };
                     break;
                 }
                 if s.event_id == c.event_id {
-                    if c.ingest < s.ingest {
-                        s.ingest = c.ingest;
+                    // A duplicate (rare): the smaller ingest_ts wins; ties are identical copies.
+                    if c.ingest < copy_at(s.at).ingest {
                         s.at = at;
                     }
                     break;
                 }
                 i = (i + 1) & mask;
             }
+            at += 1;
         }
     }
     // The kept copies that survive, then their names: the name lookups miss the
@@ -85,7 +99,7 @@ pub fn dedup(
         if s.event_id == 0 {
             continue;
         }
-        let c = &parts[(s.at >> 32) as usize][(s.at & 0xffff_ffff) as usize];
+        let c = copy_at(s.at);
         if c.flags & SURVIVES != 0 {
             kept.push(PersonEvent {
                 person: c.user,
@@ -112,6 +126,7 @@ pub fn dedup(
 const LAG: usize = 16;
 
 /// Routes clicks to their person's partition, prefetching name lookups ahead.
+#[inline(never)]
 pub fn route_clicks(clicks: &[Click], names: &Names, out: &mut Scatter<PersonClick>) {
     for c in clicks.iter().take(LAG) {
         names.prefetch(c.user);
@@ -181,6 +196,7 @@ impl Acc {
     }
 
     /// Processes one person partition, given as one slice per thread.
+    #[inline(never)]
     pub fn partition<'a>(
         &mut self,
         evs: impl Iterator<Item = &'a [PersonEvent]>,
@@ -263,6 +279,7 @@ impl Acc {
     }
 
     /// One person's events (sorted by ts) and valid clicks (sorted by ts).
+    #[inline(never)]
     fn person(&mut self, person: u64, evs: &[PersonEvent], cls: &[PersonClick]) {
         let days = self.shape.days;
         let first_day = self.shape.first_day;
