@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arena::Scatter;
 use parquet::data_type::ByteArray;
 
-use events::{Click, Context, EventCopy};
+use events::{Context, EventCopy};
 use output::Column;
 use sessions::{Acc, PersonClick, PersonEvent, Shape, NO_CATEGORY};
 use ts::DAY;
@@ -111,82 +111,77 @@ fn main() {
     let total_chunks = event_chunks.len() + click_chunks.len();
     let reserve = est_copies / (threads * eid_parts) * 5 / 4 + 16;
     let est_clicks = click_bytes / 40 + 1;
-    let click_reserve = est_clicks / threads * 5 / 4 + 16;
+    let person_click_reserve = est_clicks / (threads * person_parts) * 5 / 4 + 16;
     let next = AtomicUsize::new(0);
-    let mut names = None;
+    let names_cell: std::sync::OnceLock<links::Names> = std::sync::OnceLock::new();
     let mut event_parts: Vec<Scatter<EventCopy>> = Vec::with_capacity(threads);
-    let mut click_bufs: Vec<Scatter<Click>> = Vec::with_capacity(threads);
+    let mut person_clicks: Vec<Scatter<PersonClick>> = Vec::with_capacity(threads);
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
-                let (event_chunks, click_chunks, event_input, click_input, next, cx, link_pairs) =
-                    (&event_chunks, &click_chunks, &event_input, &click_input, &next, &cx, &link_pairs);
+                let (event_chunks, click_chunks, event_input, click_input, next, cx, link_pairs, names_cell) =
+                    (&event_chunks, &click_chunks, &event_input, &click_input, &next, &cx, &link_pairs, &names_cell);
                 s.spawn(move || {
-                    let names = (t == 0).then(|| {
+                    if t == 0 {
                         let started = std::time::Instant::now();
-                        let names = links::build(link_pairs);
+                        let _ = names_cell.set(links::build(link_pairs));
                         eprintln!("           names built in {:.3}s on thread 0", started.elapsed().as_secs_f64());
-                        names
-                    });
+                    }
                     let mut parts: Scatter<EventCopy> = Scatter::new(eid_parts, reserve);
-                    let mut clicks: Scatter<Click> = Scatter::new(1, click_reserve);
+                    let mut clicks: Scatter<PersonClick> = Scatter::new(person_parts, person_click_reserve);
                     let mut buf = Vec::new();
+                    let mut pending_events = events::Pending::new();
+                    let mut pending_clicks = events::Pending::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= total_chunks {
                             break;
                         }
                         if i < event_chunks.len() {
+                            // Names, once built, are resolved right away.
+                            let names = if std::env::var_os("SS_RESOLVE_AT_PARSE").is_some() { names_cell.get() } else { None };
                             event_input.parse::<7, _>(&event_chunks[i], &mut buf, simd, &mut |f| {
-                                events::event_fields(f, cx, &mut parts)
+                                events::event_fields(f, cx, names, &mut pending_events, &mut parts)
                             });
                         } else {
+                            // Clicks come last; they go straight to their person's partition.
+                            let names = names_cell.wait();
                             click_input.parse::<4, _>(&click_chunks[i - event_chunks.len()], &mut buf, simd, &mut |f| {
-                                events::click_fields(f, cx, &mut clicks)
+                                events::click_fields(f, cx, names, &mut pending_clicks, &mut clicks)
                             });
                         }
                     }
-                    (names, parts, clicks)
+                    if let Some(names) = names_cell.get() {
+                        events::flush_events(names, &mut pending_events, &mut parts);
+                        events::flush_clicks(names, &mut pending_clicks, &mut clicks);
+                    }
+                    (parts, clicks)
                 })
             })
             .collect();
         for h in handles {
-            let (n, parts, clicks) = h.join().unwrap();
-            if n.is_some() {
-                names = n;
-            }
+            let (parts, clicks) = h.join().unwrap();
             event_parts.push(parts);
-            click_bufs.push(clicks);
+            person_clicks.push(clicks);
         }
     });
-    let names = names.expect("names were built");
-    drop(link_pairs);
+    let names = names_cell.get().expect("names were built");
     log(&format!(
         "events parsed: {} copies, {} valid clicks",
         event_parts.iter().map(Scatter::total).sum::<usize>(),
-        click_bufs.iter().map(Scatter::total).sum::<usize>()
+        person_clicks.iter().map(Scatter::total).sum::<usize>()
     ));
 
     // Phase 2: dedup and route to person partitions.
-    const CLICK_SLICE: usize = 1 << 16;
-    let click_items: Vec<&[Click]> = click_bufs
-        .iter()
-        .flat_map(|b| b.part(0))
-        .flat_map(|slice| slice.chunks(CLICK_SLICE))
-        .collect();
     let person_reserve = est_copies / (threads * person_parts) * 5 / 4 + 16;
-    let person_click_reserve = est_clicks / (threads * person_parts) * 5 / 4 + 16;
     let next = AtomicUsize::new(0);
-    let next_click = AtomicUsize::new(0);
-    let (person_events, person_clicks): (Vec<Scatter<PersonEvent>>, Vec<Scatter<PersonClick>>) =
+    let person_events: Vec<Scatter<PersonEvent>> =
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
-                    let (event_parts, click_items, names, next, next_click) =
-                        (&event_parts, &click_items, &names, &next, &next_click);
+                    let (event_parts, next) = (&event_parts, &next);
                     s.spawn(move || {
                         let mut evs: Scatter<PersonEvent> = Scatter::new(person_parts, person_reserve);
-                        let mut cls: Scatter<PersonClick> = Scatter::new(person_parts, person_click_reserve);
                         let mut table = Vec::new();
                         let mut kept = Vec::new();
                         let mut slices: Vec<&[EventCopy]> = Vec::with_capacity(2 * event_parts.len());
@@ -199,16 +194,11 @@ fn main() {
                             slices.extend(event_parts.iter().flat_map(|t| t.part(p)));
                             sessions::dedup(&slices, names, &mut table, &mut kept, &mut evs);
                         }
-                        loop {
-                            let i = next_click.fetch_add(1, Ordering::Relaxed);
-                            let Some(&slice) = click_items.get(i) else { break };
-                            sessions::route_clicks(slice, names, &mut cls);
-                        }
-                        (evs, cls)
+                        evs
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).unzip()
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
     log("deduplicated");
 

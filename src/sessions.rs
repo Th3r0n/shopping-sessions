@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 
 use crate::arena::Scatter;
-use crate::events::{Click, EventCopy, PURCHASE, SURVIVES, WEEK};
+use crate::events::{EventCopy, PURCHASE, RESOLVED, SURVIVES, WEEK};
 use crate::hash::{bucket, mix};
 use crate::key;
 use crate::links::Names;
@@ -23,7 +23,7 @@ pub struct PersonEvent {
     pub flags: u8,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct PersonClick {
     pub person: u64,
@@ -55,24 +55,22 @@ pub fn dedup(
         return;
     }
     assert!(n < u32::MAX as usize, "partition too large");
-    // starts[k]: position of the first copy of parts[k]
-    let mut starts = [0u32; 65];
-    assert!(parts.len() < starts.len(), "too many slices");
-    for (k, part) in parts.iter().enumerate() {
-        starts[k + 1] = starts[k] + part.len() as u32;
-    }
-    let starts = &starts[..parts.len() + 1];
+    // A position packs the slice index in its high bits and the offset in the rest.
+    let slice_bits = usize::BITS - (parts.len().max(2) - 1).leading_zeros();
+    let shift = 32 - slice_bits;
+    assert!(parts.iter().all(|p| (p.len() as u64) < (1u64 << shift)), "partition too large");
+    let offset_mask = (1u64 << shift) - 1;
     let copy_at = |at: u32| -> &EventCopy {
-        let k = starts.partition_point(|&s| s <= at) - 1;
-        &parts[k][(at - starts[k]) as usize]
+        let at = at as u64;
+        &parts[(at >> shift) as usize][(at & offset_mask) as usize]
     };
     let slots = (n * 2).next_power_of_two();
     let mask = slots - 1;
     table.clear();
     table.resize(slots, Slot::default());
-    let mut at = 0u32;
-    for part in parts {
-        for c in part.iter() {
+    for (k, part) in parts.iter().enumerate() {
+        for (o, c) in part.iter().enumerate() {
+            let at = (((k as u64) << shift) | o as u64) as u32;
             let mut i = mix(c.event_id) as usize & mask;
             loop {
                 let s = &mut table[i];
@@ -89,7 +87,6 @@ pub fn dedup(
                 }
                 i = (i + 1) & mask;
             }
-            at += 1;
         }
     }
     // The kept copies that survive, then their names: the name lookups miss the
@@ -101,13 +98,18 @@ pub fn dedup(
         }
         let c = copy_at(s.at);
         if c.flags & SURVIVES != 0 {
-            kept.push(PersonEvent {
+            let e = PersonEvent {
                 person: c.user,
                 ts: c.ts,
                 price: c.price,
                 category: c.category,
                 flags: c.flags,
-            });
+            };
+            if c.flags & RESOLVED != 0 {
+                out.push(bucket(mix(e.person), out.parts()), e);
+            } else {
+                kept.push(e);
+            }
         }
     }
     for e in kept.iter().take(LAG) {
@@ -124,29 +126,6 @@ pub fn dedup(
 }
 
 const LAG: usize = 16;
-
-/// Routes clicks to their person's partition, prefetching name lookups ahead.
-#[inline(never)]
-pub fn route_clicks(clicks: &[Click], names: &Names, out: &mut Scatter<PersonClick>) {
-    for c in clicks.iter().take(LAG) {
-        names.prefetch(c.user);
-    }
-    for (i, c) in clicks.iter().enumerate() {
-        if let Some(ahead) = clicks.get(i + LAG) {
-            names.prefetch(ahead.user);
-        }
-        let person = names.get(c.user);
-        out.push(
-            bucket(mix(person), out.parts()),
-            PersonClick {
-                person,
-                ts: c.ts,
-                click_id: c.click_id,
-                campaign: c.campaign,
-            },
-        );
-    }
-}
 
 #[derive(Clone, Copy)]
 pub struct Shape {
