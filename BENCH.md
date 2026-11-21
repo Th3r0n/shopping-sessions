@@ -139,3 +139,7 @@ generic mode is checked by starting it directly (`/pipeline --generic`: same arg
 Timing cannot be done locally: A/B on the scorer with `probe/` (scripts/probe/Dockerfile.*), which runs
 variants A and B alternately (ABBA, best of 3 each) in one container, then A for real into /output, and ends
 at AB_BASE + AB_SCALE x (A - B) seconds (10 + 100 x by default).
+
+| scorer probe | commit | variants | score | reading |
+| --- | --- | --- | --- | --- |
+| P8 ab-pgo | df71ca5 | A = PGO build, B = same source without; ends at 10 + 100 x (A - B) | 10.15 s | A - B ~ 0 (at most +1.5 ms with ~0.15 s fixed cost): PGO dropped |

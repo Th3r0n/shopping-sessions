@@ -1892,6 +1892,7 @@ pub(crate) fn cpu_order() -> &'static Vec<usize> {
         let allowed: Vec<usize> = (0..1024).filter(|&c| m[c / 64] >> (c % 64) & 1 != 0).collect();
         let mut seen = vec![false; 1024];
         let mut out = Vec::new();
+        let mut cores: Vec<Vec<usize>> = Vec::new();
         for &c in &allowed {
             if seen[c] {
                 continue;
@@ -1912,12 +1913,24 @@ pub(crate) fn cpu_order() -> &'static Vec<usize> {
             if !has_c {
                 grp = vec![c];
             }
+            let mut core = Vec::new();
             for x in grp {
                 if x < 1024 && !seen[x] && m[x / 64] >> (x % 64) & 1 != 0 {
                     seen[x] = true;
-                    out.push(x);
+                    core.push(x);
                 }
             }
+            cores.push(core);
+        }
+        // Sibling-adjacent (default): thread 2k and 2k+1 share a core. Core-first
+        // (XL_COREFIRST=1): one thread per physical core before any second hyperthread.
+        if std::env::var("XL_COREFIRST").is_ok_and(|v| v == "1") {
+            let deepest = cores.iter().map(Vec::len).max().unwrap_or(0);
+            for k in 0..deepest {
+                out.extend(cores.iter().filter_map(|c| c.get(k).copied()));
+            }
+        } else {
+            out.extend(cores.into_iter().flatten());
         }
         out
     })
