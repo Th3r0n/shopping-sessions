@@ -15,6 +15,29 @@ struct Region<T> {
 #[cfg(target_os = "linux")]
 const HUGE: usize = 2 << 20;
 
+static PREFAULT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("SS_PREFAULT").as_deref() == Ok("1"));
+
+/// With SS_PREFAULT=1: when `offset..offset + len` (bytes from a 2 MiB-aligned region
+/// start) enters a new 2 MiB step, maps that whole step in one call
+/// (MADV_POPULATE_WRITE) instead of one page fault per 4 KiB page.
+#[inline]
+fn prefault_step(base: *mut u8, offset: usize, len: usize, region_bytes: usize) {
+    #[cfg(target_os = "linux")]
+    if *PREFAULT && offset % HUGE == 0 || *PREFAULT && (offset + len - 1) / HUGE != offset / HUGE {
+        let step = (offset + len - 1) / HUGE * HUGE;
+        let n = HUGE.min(region_bytes.saturating_sub(step));
+        if n > 0 {
+            const MADV_POPULATE_WRITE: libc::c_int = 23;
+            // SAFETY: advice on memory of our own mapping; failures are ignored.
+            unsafe {
+                libc::madvise(base.add(step) as *mut libc::c_void, n, MADV_POPULATE_WRITE);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (base, offset, len, region_bytes);
+}
+
 /// Every region mapped so far (start, bytes), for `release_all`.
 #[cfg(target_os = "linux")]
 static MAPPED: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
@@ -231,6 +254,8 @@ impl<T: Copy> Scatter<T> {
             None if self.used + self.block <= self.capacity => {
                 // SAFETY: used + block <= capacity, inside the region.
                 let b = unsafe { self.region.ptr.add(self.used) };
+                let size = std::mem::size_of::<T>();
+                prefault_step(self.region.ptr as *mut u8, self.used * size, self.block * size, self.capacity * size);
                 self.used += self.block;
                 b
             }
@@ -446,7 +471,9 @@ impl Words3 {
             self.used = 0;
         }
         // SAFETY: used + UNIT_WORDS <= capacity, inside the last region.
-        let b = unsafe { self.regions.last().unwrap().ptr.add(self.used) };
+        let base = self.regions.last().unwrap().ptr;
+        let b = unsafe { base.add(self.used) };
+        prefault_step(base as *mut u8, self.used * 8, UNIT_WORDS * 8, self.capacity * 8);
         self.used += UNIT_WORDS;
         self.blocks[p].push(b);
         self.current[p] = b;
