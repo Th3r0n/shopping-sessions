@@ -1,20 +1,22 @@
 [package]
-name = "shopping-sessions"
+name = "pipeline"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "shopping-sessions"
+name = "pipeline"
 path = "src/main.rs"
 
-[dependencies]
-memchr = "2.8"
-memmap2 = "0.9"
-serde_json = "1"
+[features]
+stats = []
+knobs = []
+testkeys = []
+pmu = []
+tl = []
+sp = []
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+[dependencies]
 
 [profile.release]
 opt-level = 3

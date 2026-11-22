@@ -1,6 +1,1 @@
-target/
-/data/
-/dev/
-/out/
-__pycache__/
-*.pyc
+target
