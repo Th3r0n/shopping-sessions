@@ -1,20 +1,13 @@
 [package]
-name = "pipeline"
+name = "shopping-sessions"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "MIT"
 
 [[bin]]
-name = "pipeline"
+name = "sessions"
 path = "src/main.rs"
-
-[features]
-stats = []
-knobs = []
-testkeys = []
-pmu = []
-tl = []
-sp = []
 
 [dependencies]
 

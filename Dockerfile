@@ -1,13 +1,15 @@
-FROM rust:1-alpine AS build
-RUN apk add --no-cache musl-dev
+# Shopping Sessions: native Rust pipeline, one static binary in an empty image.
+FROM rust:1.85.1-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY .cargo .cargo
-COPY src src
-RUN cargo build --release --target x86_64-unknown-linux-musl \
- && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline
+COPY src ./src
+COPY pgo ./pgo
+# Profile-guided optimization with the committed profile (pgo/make_profile.sh makes it).
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static -Cprofile-use=/src/pgo/x86.profdata"
+RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
+ && cp target/x86_64-unknown-linux-gnu/release/sessions /sessions
 
 FROM scratch
-COPY --from=build /pipeline /pipeline
+COPY --from=build /sessions /sessions
 USER 1000:1000
-CMD ["/pipeline"]
+CMD ["/sessions"]
